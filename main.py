@@ -3,6 +3,7 @@
 
 import os
 import sys
+import re
 import subprocess
 import platform
 import tempfile
@@ -830,10 +831,21 @@ class WhisperUI(QMainWindow):
         self.transcriber = None
         self.downloader = None
         self.current_audio_file = None
-        self.dark_mode = False
         
-        # Load saved settings
-        self.load_settings()
+        # Enable dark mode by default
+        self.dark_mode = True
+        self.toggle_dark_mode(True)
+        if hasattr(self, 'dark_mode_check'):
+            self.dark_mode_check.setChecked(True)
+        
+        # Load saved settings or use defaults
+        settings_loaded = self.load_settings()
+        if not settings_loaded:
+            # Set push-to-talk as default if no settings were loaded
+            if hasattr(self, 'push_to_talk_radio'):
+                self.push_to_talk_radio.setChecked(True)
+                self.toggle_mode_radio.setChecked(False)
+                self.on_mode_changed()
         
         # Check if any models are installed and download default if needed
         self.check_and_download_default_model()
@@ -2242,25 +2254,24 @@ class WhisperUI(QMainWindow):
                 """)
 
     def clean_transcription(self, text, keep_timestamps=False):
-        """Remove timestamps and clean up the transcription text"""
-        import re
-        
-        cleaned_text = text
+        """Clean up the transcription text"""
+        if not text:
+            return text
+            
+        # Remove [Silence] markers
+        text = re.sub(r'\[Silence\]\s*', '', text)
         
         if not keep_timestamps:
-            # Remove timestamp lines like [00:00:00.000 --> 00:00:02.580]
-            cleaned_text = re.sub(r'\[\d{2}:\d{2}:\d{2}\.\d{3} --> \d{2}:\d{2}:\d{2}\.\d{3}\]\s*', '', cleaned_text)
+            # Remove timestamps if present
+            text = re.sub(r'\[\d{2}:\d{2}:\d{2}\.\d{3} --> \d{2}:\d{2}:\d{2}\.\d{3}\]\s*', '', text)
         
-        # Remove [BLANK_AUDIO] markers
-        cleaned_text = re.sub(r'\[BLANK_AUDIO\]', '', cleaned_text)
+        # Remove multiple newlines
+        text = re.sub(r'\n{3,}', '\n\n', text)
         
-        # Remove any extra whitespace
-        cleaned_text = re.sub(r'\s+', ' ' if not keep_timestamps else '\n', cleaned_text)
+        # Remove leading/trailing whitespace
+        text = text.strip()
         
-        # Trim leading/trailing whitespace
-        cleaned_text = cleaned_text.strip()
-        
-        return cleaned_text
+        return text
 
     def check_and_download_default_model(self):
         """Check if any models are installed, and if not, download the base.en model"""
