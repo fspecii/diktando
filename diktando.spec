@@ -12,10 +12,10 @@ qt_data = collect_data_files('PyQt5', include_py_files=True)
 qt_binaries = collect_dynamic_libs('PyQt5')
 
 # Add icon to data files
-icon_data = [('new_icon.ico', '.')]
+icon_data = [('icon.ico', '.')]
 
 a = Analysis(
-    ['main.py', 'clipboard_manager.py'],
+    ['main.py', 'clipboard_manager.py', 'updater.py'],
     pathex=[],
     binaries=qt_binaries,
     datas=qt_data + icon_data,
@@ -31,7 +31,11 @@ a = Analysis(
         'PyQt5.QtCore',
         'PyQt5.QtGui',
         'PyQt5.QtWidgets',
-        'clipboard_manager'
+        'clipboard_manager',
+        'packaging.version',
+        'packaging.specifiers',
+        'packaging.requirements',
+        'packaging.markers'
     ],
     hookspath=[],
     hooksconfig={
@@ -69,5 +73,5 @@ exe = EXE(
     target_arch=None,
     codesign_identity=None,
     entitlements_file=None,
-    icon='new_icon.ico'
+    icon='venv/Lib/site-packages/PyInstaller/bootloader/images/icon-windowed.ico'
 )

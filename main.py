@@ -21,7 +21,7 @@ from PyQt5.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, 
     QPushButton, QLabel, QComboBox, QProgressBar, QFileDialog, 
     QMessageBox, QTabWidget, QGroupBox, QRadioButton, QTextEdit,
-    QCheckBox, QDialog, QStatusBar, QButtonGroup, QMenu
+    QCheckBox, QDialog, QStatusBar, QButtonGroup, QMenu, QStyle
 )
 from updater import UpdateChecker
 
@@ -750,11 +750,14 @@ class WhisperUI(QMainWindow):
         # Set application icon
         icon_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "icon.ico")
         if os.path.exists(icon_path):
-            self.setWindowIcon(QIcon(icon_path))
-            # Also set the taskbar icon
+            icon = QIcon(icon_path)
+            self.setWindowIcon(icon)
+            # Set the application-wide icon
+            QApplication.setWindowIcon(icon)
+            # Also set the taskbar icon for Windows
             if platform.system() == "Windows":
                 import ctypes
-                myappid = 'diktando.speech.recognition.1.0'
+                myappid = u'diktando.speech.recognition.1.1'  # arbitrary string
                 ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(myappid)
         
         # Initialize update checker
@@ -2949,21 +2952,50 @@ class WhisperUI(QMainWindow):
 
     def show_update_dialog(self, current_version, latest_version):
         """Show a dialog when an update is available"""
-        msg = QMessageBox()
-        msg.setIcon(QMessageBox.Information)
-        msg.setWindowTitle("Update Available")
-        msg.setText(f"A new version of Diktando is available!")
-        msg.setInformativeText(f"Current version: {current_version}\nLatest version: {latest_version}\n\nWould you like to update now?")
-        msg.setStandardButtons(QMessageBox.Yes | QMessageBox.No)
+        # Prevent multiple update dialogs
+        if hasattr(self, '_update_dialog') and self._update_dialog is not None:
+            return
+            
+        # Create and show the update dialog
+        self._update_dialog = UpdateDialog(self, current_version, latest_version)
         
-        if msg.exec() == QMessageBox.Yes:
+        result = self._update_dialog.exec()
+        
+        if result == QDialog.DialogCode.Accepted:
+            # Show progress in dialog
+            self._update_dialog.show_progress()
+            
             # Start the update process
             self.status_bar.showMessage("Downloading update...")
             self.show_overlay("Downloading update...")
+            
+            # Start the update process
             latest_release = self.update_checker.check_for_updates(silent=True)
             if latest_release:
+                # Connect progress signal before starting download
+                self.update_checker.update_progress_signal.connect(self._update_dialog.update_progress)
+                # Connect cleanup to happen after download is complete
+                self.update_checker.update_success_signal.connect(self._cleanup_update_dialog)
+                self.update_checker.update_error_signal.connect(self._cleanup_update_dialog)
                 self.update_checker.download_and_install_update(latest_release)
+        else:
+            # Clean up immediately if dialog was rejected
+            self._cleanup_update_dialog()
     
+    def _cleanup_update_dialog(self):
+        """Clean up update dialog references and connections"""
+        if hasattr(self, '_update_dialog') and self._update_dialog is not None:
+            try:
+                # Only try to disconnect if the dialog accepted (update started)
+                if self._update_dialog.update_in_progress:
+                    self.update_checker.update_progress_signal.disconnect(self._update_dialog.update_progress)
+                    self.update_checker.update_success_signal.disconnect(self._cleanup_update_dialog)
+                    self.update_checker.update_error_signal.disconnect(self._cleanup_update_dialog)
+            except (TypeError, RuntimeError):
+                # Ignore errors if signals weren't connected
+                pass
+            self._update_dialog = None
+
     def update_progress(self, progress):
         """Update the progress of the download"""
         self.status_bar.showMessage(f"Downloading update: {progress}%")
@@ -2974,6 +3006,90 @@ class WhisperUI(QMainWindow):
         self.status_bar.showMessage("Update downloaded. Restarting application...")
         self.show_overlay("Update successful! Restarting...")
         QTimer.singleShot(2000, self.close)  # Close after 2 seconds
+
+
+class UpdateDialog(QDialog):
+    """Custom dialog for update confirmation and progress"""
+    def __init__(self, parent=None, current_version=None, latest_version=None):
+        super().__init__(parent)
+        self.setWindowTitle("Update Available")
+        self.setModal(True)
+        self.setMinimumWidth(400)
+        
+        # Create layout
+        layout = QVBoxLayout(self)
+        
+        # Add icon and message
+        message_layout = QHBoxLayout()
+        icon_label = QLabel()
+        icon_label.setPixmap(self.style().standardIcon(QStyle.SP_MessageBoxInformation).pixmap(32, 32))
+        message_layout.addWidget(icon_label)
+        
+        message_text = QLabel(
+            f"A new version of Diktando is available!\n\n"
+            f"Current version: {current_version}\n"
+            f"Latest version: {latest_version}\n\n"
+            f"Would you like to update now?"
+        )
+        message_text.setWordWrap(True)
+        message_layout.addWidget(message_text)
+        layout.addLayout(message_layout)
+        
+        # Add progress bar (hidden initially)
+        self.progress_bar = QProgressBar(self)
+        self.progress_bar.setRange(0, 100)
+        self.progress_bar.setValue(0)
+        self.progress_bar.hide()
+        layout.addWidget(self.progress_bar)
+        
+        # Add buttons
+        button_box = QHBoxLayout()
+        
+        self.update_button = QPushButton("Update Now")
+        self.update_button.clicked.connect(self._handle_update_click)
+        
+        self.cancel_button = QPushButton("Cancel")
+        self.cancel_button.clicked.connect(self.reject)
+        
+        button_box.addWidget(self.update_button)
+        button_box.addWidget(self.cancel_button)
+        layout.addLayout(button_box)
+        
+        # Flag to track if update is in progress
+        self.update_in_progress = False
+        
+        # Remove the close button from the title bar
+        self.setWindowFlags(self.windowFlags() & ~Qt.WindowCloseButtonHint)
+    
+    def _handle_update_click(self):
+        """Handle update button click by disabling it immediately and accepting the dialog"""
+        if not self.update_in_progress:
+            self.update_in_progress = True
+            self.update_button.setEnabled(False)
+            self.update_button.setText("Starting update...")
+            self.cancel_button.setEnabled(False)
+            self.accept()
+    
+    def show_progress(self):
+        """Show progress bar and disable update button"""
+        self.progress_bar.show()
+        self.update_button.setText("Updating...")
+    
+    def update_progress(self, value):
+        """Update the progress bar value"""
+        self.progress_bar.setValue(value)
+    
+    def closeEvent(self, event):
+        """Handle dialog close event"""
+        if self.update_in_progress:
+            event.ignore()
+        else:
+            event.accept()
+            
+    def reject(self):
+        """Handle dialog rejection (Cancel button or Escape key)"""
+        if not self.update_in_progress:
+            super().reject()
 
 
 

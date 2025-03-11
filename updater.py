@@ -24,7 +24,9 @@ class UpdateChecker(QObject):
         """Get the path of the current executable"""
         if getattr(sys, 'frozen', False):
             return sys.executable
-        return None
+        else:
+            # For development/non-frozen environment, use the script path
+            return os.path.abspath(sys.argv[0])
 
     def check_for_updates(self, silent=True):
         """Check for updates on GitHub
