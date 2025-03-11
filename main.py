@@ -3,37 +3,31 @@
 
 import os
 import sys
-import re
-import subprocess
-import platform
-import tempfile
-import time
 import json
-import hashlib
+import time
+import wave
 import shutil
-from pathlib import Path
+import platform
 import threading
-import queue
-import datetime
-
+import subprocess
 import numpy as np
 import sounddevice as sd
 import soundfile as sf
-import requests
-from tqdm import tqdm
-import pyperclip
+from pathlib import Path
+from datetime import datetime
+from PyQt5.QtCore import Qt, QThread, pyqtSignal, QTimer, QSize, QUrl
+from PyQt5.QtGui import QIcon, QTextCursor, QPainter, QColor, QFont, QDesktopServices, QKeySequence
 from PyQt5.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, 
-    QPushButton, QLabel, QComboBox, QFileDialog, QTextEdit, 
-    QProgressBar, QMessageBox, QTabWidget, QGroupBox, QRadioButton,
-    QCheckBox, QSpinBox, QSlider, QStatusBar, QKeySequenceEdit, QFrame, QDialog, QButtonGroup,
-    QMenu
+    QPushButton, QLabel, QComboBox, QProgressBar, QFileDialog, 
+    QMessageBox, QTabWidget, QGroupBox, QRadioButton, QTextEdit,
+    QCheckBox, QDialog, QStatusBar, QButtonGroup, QMenu
 )
-from PyQt5.QtCore import Qt, QTimer, pyqtSignal, QThread, QUrl, QEvent
-from PyQt5.QtGui import QIcon, QPixmap, QDesktopServices, QKeySequence, QTextCursor
+from updater import UpdateChecker
 
 # Import custom modules
 from clipboard_manager import ClipboardManager
+from updater import UpdateChecker
 
 # Import keyboard hook library based on platform
 if platform.system() == "Windows":
@@ -754,31 +748,24 @@ class WhisperUI(QMainWindow):
         super().__init__()
         
         # Set application icon
-        if getattr(sys, 'frozen', False):
-            # Running in PyInstaller bundle
-            application_path = sys._MEIPASS
-        else:
-            # Running in normal Python environment
-            application_path = os.path.dirname(os.path.abspath(__file__))
-            
-        icon_path = os.path.join(application_path, "new_icon.ico")
-        print(f"Loading icon from: {icon_path}")
+        icon_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "icon.ico")
         if os.path.exists(icon_path):
-            print("Icon file exists, setting window icon...")
-            icon = QIcon(icon_path)
-            if not icon.isNull():
-                print("Icon loaded successfully")
-                self.setWindowIcon(icon)
-                # Also set the taskbar icon
-                if platform.system() == "Windows":
-                    print("Setting Windows taskbar icon...")
-                    import ctypes
-                    myappid = 'diktando.speech.recognition.1.0'
-                    ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(myappid)
-            else:
-                print("Failed to load icon - icon is null")
-        else:
-            print(f"Icon file not found at {icon_path}")
+            self.setWindowIcon(QIcon(icon_path))
+            # Also set the taskbar icon
+            if platform.system() == "Windows":
+                import ctypes
+                myappid = 'diktando.speech.recognition.1.0'
+                ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(myappid)
+        
+        # Initialize update checker
+        self.update_checker = UpdateChecker()
+        self.update_checker.update_available_signal.connect(self.show_update_dialog)
+        self.update_checker.update_progress_signal.connect(self.update_progress)
+        self.update_checker.update_error_signal.connect(self.show_error)
+        self.update_checker.update_success_signal.connect(self.handle_update_success)
+        
+        # Initialize clipboard manager
+        self.clipboard_manager = ClipboardManager()
         
         # Set up the UI
         self.setWindowTitle("Diktando")
@@ -810,9 +797,6 @@ class WhisperUI(QMainWindow):
             self.show_error("Failed to download required files. Please check your internet connection and try again.")
             return
         
-        # Initialize clipboard manager
-        self.clipboard_manager = ClipboardManager()
-        
         # Initialize hotkey manager
         self.hotkey_manager = HotkeyManager(self)
         self.hotkey_manager.hotkey_toggle_signal.connect(self.on_hotkey_toggle)
@@ -831,21 +815,10 @@ class WhisperUI(QMainWindow):
         self.transcriber = None
         self.downloader = None
         self.current_audio_file = None
+        self.dark_mode = False
         
-        # Enable dark mode by default
-        self.dark_mode = True
-        self.toggle_dark_mode(True)
-        if hasattr(self, 'dark_mode_check'):
-            self.dark_mode_check.setChecked(True)
-        
-        # Load saved settings or use defaults
-        settings_loaded = self.load_settings()
-        if not settings_loaded:
-            # Set push-to-talk as default if no settings were loaded
-            if hasattr(self, 'push_to_talk_radio'):
-                self.push_to_talk_radio.setChecked(True)
-                self.toggle_mode_radio.setChecked(False)
-                self.on_mode_changed()
+        # Load saved settings
+        self.load_settings()
         
         # Check if any models are installed and download default if needed
         self.check_and_download_default_model()
@@ -865,6 +838,10 @@ class WhisperUI(QMainWindow):
         # Generate silence file if it doesn't exist
         if not os.path.exists(self.silence_path):
             self.generate_silence_file()
+        
+        # Check for updates if enabled
+        if hasattr(self, 'auto_check_updates') and self.auto_check_updates.isChecked():
+            QTimer.singleShot(1000, lambda: self.update_checker.check_for_updates(silent=True))
     
     def __del__(self):
         """Destructor to clean up resources"""
@@ -1140,6 +1117,18 @@ class WhisperUI(QMainWindow):
         mic_controls_layout.addWidget(QLabel("Audio Device:"))
         mic_controls_layout.addWidget(self.device_combo)
         
+        # Add sample rate combo box
+        mic_controls_layout.addWidget(QLabel("Sample Rate:"))
+        self.sample_rate_combo = QComboBox()
+        self.sample_rate_combo.addItems(["16000", "44100", "48000"])
+        mic_controls_layout.addWidget(self.sample_rate_combo)
+        
+        # Add channels combo box
+        mic_controls_layout.addWidget(QLabel("Channels:"))
+        self.channels_combo = QComboBox()
+        self.channels_combo.addItems(["Mono", "Stereo"])
+        mic_controls_layout.addWidget(self.channels_combo)
+        
         mic_layout.addLayout(mic_controls_layout)
         
         record_layout = QHBoxLayout()
@@ -1279,92 +1268,36 @@ class WhisperUI(QMainWindow):
         layout.addWidget(installed_group)
     
     def setup_settings_tab(self, tab):
-        """Set up the settings tab"""
-        
         layout = QVBoxLayout(tab)
-        
-        # Audio settings
-        audio_group = QGroupBox("Audio Settings")
-        audio_layout = QVBoxLayout(audio_group)
-        
-        sample_rate_layout = QHBoxLayout()
-        sample_rate_layout.addWidget(QLabel("Sample Rate:"))
-        self.sample_rate_combo = QComboBox()
-        self.sample_rate_combo.addItems(["16000", "22050", "44100", "48000"])
-        self.sample_rate_combo.setCurrentText("16000")
-        sample_rate_layout.addWidget(self.sample_rate_combo)
-        audio_layout.addLayout(sample_rate_layout)
-        
-        channels_layout = QHBoxLayout()
-        channels_layout.addWidget(QLabel("Channels:"))
-        self.channels_combo = QComboBox()
-        self.channels_combo.addItems(["1 (Mono)", "2 (Stereo)"])
-        self.channels_combo.setCurrentIndex(0)
-        channels_layout.addWidget(self.channels_combo)
-        audio_layout.addLayout(channels_layout)
-        
-        layout.addWidget(audio_group)
         
         # Hotkey settings
         hotkey_group = QGroupBox("Hotkey Settings")
         hotkey_layout = QVBoxLayout(hotkey_group)
         
+        # Enable hotkey checkbox
         self.enable_hotkey_check = QCheckBox("Enable Global Hotkey")
         self.enable_hotkey_check.toggled.connect(self.toggle_hotkey)
         hotkey_layout.addWidget(self.enable_hotkey_check)
         
-        # Recording mode group
-        mode_group = QGroupBox("Recording Mode")
-        mode_layout = QVBoxLayout(mode_group)
-        mode_layout.setSpacing(5)
-        mode_layout.setContentsMargins(8, 8, 8, 8)
-        
-        # Create button group for mutual exclusivity
-        button_group = QButtonGroup(mode_group)
-        
-        # Toggle mode option with more compact layout
-        toggle_widget = QWidget()
-        toggle_layout = QHBoxLayout(toggle_widget)
-        toggle_layout.setContentsMargins(0, 0, 0, 0)
-        
-        self.toggle_mode_radio = QRadioButton("Toggle Mode")
-        self.toggle_mode_radio.setChecked(True)
-        self.toggle_mode_radio.toggled.connect(self.on_mode_changed)
-        button_group.addButton(self.toggle_mode_radio)
-        toggle_layout.addWidget(self.toggle_mode_radio)
-        
-        toggle_description = QLabel("(click to start/stop)")
-        toggle_description.setStyleSheet("color: gray;")
-        toggle_layout.addWidget(toggle_description)
-        toggle_layout.addStretch()
-        
-        mode_layout.addWidget(toggle_widget)
-        
-        # Push-to-talk option with more compact layout
-        ptt_widget = QWidget()
-        ptt_layout = QHBoxLayout(ptt_widget)
-        ptt_layout.setContentsMargins(0, 0, 0, 0)
-        
+        # Mode selection
+        mode_group = QButtonGroup(self)
         self.push_to_talk_radio = QRadioButton("Push-to-Talk Mode")
-        self.push_to_talk_radio.toggled.connect(self.on_mode_changed)
-        button_group.addButton(self.push_to_talk_radio)
-        ptt_layout.addWidget(self.push_to_talk_radio)
+        self.toggle_mode_radio = QRadioButton("Toggle Mode")
+        mode_group.addButton(self.push_to_talk_radio)
+        mode_group.addButton(self.toggle_mode_radio)
         
-        ptt_description = QLabel("(hold to record)")
-        ptt_description.setStyleSheet("color: gray;")
-        ptt_layout.addWidget(ptt_description)
-        ptt_layout.addStretch()
+        # Set push-to-talk as default
+        self.push_to_talk_radio.setChecked(True)
+        self.toggle_mode_radio.setChecked(False)
         
-        mode_layout.addWidget(ptt_widget)
-        
-        hotkey_layout.addWidget(mode_group)
+        mode_group.buttonClicked.connect(self.on_mode_changed)
+        hotkey_layout.addWidget(self.push_to_talk_radio)
+        hotkey_layout.addWidget(self.toggle_mode_radio)
         
         # Hotkey configuration
         hotkey_config_layout = QHBoxLayout()
-        hotkey_config_layout.addWidget(QLabel("Current Hotkey:"))
-        
-        self.hotkey_label = QLabel("F8")  # Default hotkey
-        self.hotkey_label.setStyleSheet("font-weight: bold;")
+        hotkey_config_layout.addWidget(QLabel("Hotkey:"))
+        self.hotkey_label = QLabel("f8")
         hotkey_config_layout.addWidget(self.hotkey_label)
         
         configure_button = QPushButton("Configure")
@@ -1377,20 +1310,7 @@ class WhisperUI(QMainWindow):
         # Add auto-paste option
         self.auto_paste_check = QCheckBox("Automatically paste transcription (may require permissions)")
         self.auto_paste_check.setChecked(True)
-        self.auto_paste_check.setToolTip("When disabled, transcription will only be copied to clipboard without pasting")
         hotkey_layout.addWidget(self.auto_paste_check)
-        
-        # Add hotkey info
-        hotkey_info = QLabel(
-            "Press the hotkey once to start recording, press again to stop and transcribe.\n"
-            "The transcription will automatically replace your clipboard content\n"
-            "and be pasted at the cursor position (if auto-paste is enabled).\n\n"
-            "When recording is active, the window title will show 'RECORDING'.\n"
-            "If you experience transcription errors, try speaking more clearly and\n"
-            "ensure your microphone is working properly."
-        )
-        hotkey_info.setWordWrap(True)
-        hotkey_layout.addWidget(hotkey_info)
         
         layout.addWidget(hotkey_group)
         
@@ -1415,6 +1335,22 @@ class WhisperUI(QMainWindow):
         
         layout.addWidget(app_group)
         
+        # Update settings
+        update_group = QGroupBox("Updates")
+        update_layout = QVBoxLayout(update_group)
+        
+        # Add check for updates button
+        check_updates_btn = QPushButton("Check for Updates")
+        check_updates_btn.clicked.connect(lambda: self.update_checker.check_for_updates(silent=False))
+        update_layout.addWidget(check_updates_btn)
+        
+        # Add auto-check for updates option
+        self.auto_check_updates = QCheckBox("Check for updates on startup")
+        self.auto_check_updates.setChecked(True)
+        update_layout.addWidget(self.auto_check_updates)
+        
+        layout.addWidget(update_group)
+        
         # About section
         about_group = QGroupBox("About")
         about_layout = QVBoxLayout(about_group)
@@ -1423,9 +1359,9 @@ class WhisperUI(QMainWindow):
         "Diktando\n"
             "A Windows GUI for OpenAI's Whisper speech recognition model\n"
             "Using whisper-cpp for local transcription\n"
-            "Version: 1.0.0\n"
+            f"Version: {self.update_checker.CURRENT_VERSION}\n"
         )
-        about_text.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        about_text.setAlignment(Qt.AlignCenter)
         about_layout.addWidget(about_text)
         
         github_button = QPushButton("Visit GitHub Repository")
@@ -2254,24 +2190,25 @@ class WhisperUI(QMainWindow):
                 """)
 
     def clean_transcription(self, text, keep_timestamps=False):
-        """Clean up the transcription text"""
-        if not text:
-            return text
-            
-        # Remove [Silence] markers
-        text = re.sub(r'\[Silence\]\s*', '', text)
+        """Remove timestamps and clean up the transcription text"""
+        import re
+        
+        cleaned_text = text
         
         if not keep_timestamps:
-            # Remove timestamps if present
-            text = re.sub(r'\[\d{2}:\d{2}:\d{2}\.\d{3} --> \d{2}:\d{2}:\d{2}\.\d{3}\]\s*', '', text)
+        # Remove timestamp lines like [00:00:00.000 --> 00:00:02.580]
+            cleaned_text = re.sub(r'\[\d{2}:\d{2}:\d{2}\.\d{3} --> \d{2}:\d{2}:\d{2}\.\d{3}\]\s*', '', cleaned_text)
         
-        # Remove multiple newlines
-        text = re.sub(r'\n{3,}', '\n\n', text)
+        # Remove [BLANK_AUDIO] markers
+        cleaned_text = re.sub(r'\[BLANK_AUDIO\]', '', cleaned_text)
         
-        # Remove leading/trailing whitespace
-        text = text.strip()
+        # Remove any extra whitespace
+        cleaned_text = re.sub(r'\s+', ' ' if not keep_timestamps else '\n', cleaned_text)
         
-        return text
+        # Trim leading/trailing whitespace
+        cleaned_text = cleaned_text.strip()
+        
+        return cleaned_text
 
     def check_and_download_default_model(self):
         """Check if any models are installed, and if not, download the base.en model"""
@@ -2374,27 +2311,46 @@ class WhisperUI(QMainWindow):
         return os.path.join(settings_dir, "settings.json")
     
     def load_settings(self):
-        """Load settings from file"""
-        settings_file = self.get_settings_file()
-        if os.path.exists(settings_file):
-            try:
+        """Load application settings"""
+        try:
+            settings_file = self.get_settings_file()
+            if os.path.exists(settings_file):
                 with open(settings_file, 'r') as f:
                     settings = json.load(f)
+                    
                     # Load hotkey
                     if 'hotkey' in settings:
                         self.hotkey_label.setText(settings['hotkey'])
-                    # Load mode
-                    if 'push_to_talk' in settings:
-                        self.push_to_talk_radio.setChecked(settings['push_to_talk'])
-                        self.toggle_mode_radio.setChecked(not settings['push_to_talk'])
+                        self.hotkey_manager.set_hotkey(settings['hotkey'])
+                    
+                    # Load mode settings with push-to-talk as default
+                    is_push_to_talk = settings.get('push_to_talk', True)  # Default to True
+                    self.push_to_talk_radio.setChecked(is_push_to_talk)
+                    self.toggle_mode_radio.setChecked(not is_push_to_talk)
+                    self.hotkey_manager.set_mode(is_push_to_talk)
+                    
                     # Load dark mode setting
-                    if 'dark_mode' in settings:
-                        self.dark_mode_check.setChecked(settings['dark_mode'])
-                        # Apply dark mode if enabled
-                        if settings['dark_mode']:
-                            self.toggle_dark_mode(True)
-            except Exception as e:
-                print(f"Error loading settings: {str(e)}")
+                    if settings.get('dark_mode', True):  # Default to True
+                        self.dark_mode_check.setChecked(True)
+                        self.toggle_dark_mode(True)
+                    
+                    # Load auto-check updates setting
+                    self.auto_check_updates.setChecked(settings.get('auto_check_updates', True))
+            else:
+                # Set defaults for new installation
+                self.push_to_talk_radio.setChecked(True)
+                self.toggle_mode_radio.setChecked(False)
+                self.hotkey_manager.set_mode(True)
+                self.dark_mode_check.setChecked(True)
+                self.toggle_dark_mode(True)
+        except Exception as e:
+            print(f"Error loading settings: {str(e)}")
+            # Set defaults on error
+            self.push_to_talk_radio.setChecked(True)
+            self.toggle_mode_radio.setChecked(False)
+            self.hotkey_manager.set_mode(True)
+            self.dark_mode_check.setChecked(True)
+            self.toggle_dark_mode(True)
     
     def save_settings(self):
         """Save settings to file"""
@@ -2403,7 +2359,8 @@ class WhisperUI(QMainWindow):
             settings = {
                 'hotkey': self.hotkey_label.text(),
                 'push_to_talk': self.push_to_talk_radio.isChecked(),
-                'dark_mode': self.dark_mode_check.isChecked()
+                'dark_mode': self.dark_mode_check.isChecked(),
+                'auto_check_updates': self.auto_check_updates.isChecked()
             }
             with open(settings_file, 'w') as f:
                 json.dump(settings, f)
@@ -2989,6 +2946,34 @@ class WhisperUI(QMainWindow):
             self.log_message("Full text being processed:")
             self.log_message(text)
             raise
+
+    def show_update_dialog(self, current_version, latest_version):
+        """Show a dialog when an update is available"""
+        msg = QMessageBox()
+        msg.setIcon(QMessageBox.Information)
+        msg.setWindowTitle("Update Available")
+        msg.setText(f"A new version of Diktando is available!")
+        msg.setInformativeText(f"Current version: {current_version}\nLatest version: {latest_version}\n\nWould you like to update now?")
+        msg.setStandardButtons(QMessageBox.Yes | QMessageBox.No)
+        
+        if msg.exec() == QMessageBox.Yes:
+            # Start the update process
+            self.status_bar.showMessage("Downloading update...")
+            self.show_overlay("Downloading update...")
+            latest_release = self.update_checker.check_for_updates(silent=True)
+            if latest_release:
+                self.update_checker.download_and_install_update(latest_release)
+    
+    def update_progress(self, progress):
+        """Update the progress of the download"""
+        self.status_bar.showMessage(f"Downloading update: {progress}%")
+        self.show_overlay(f"Downloading: {progress}%")
+    
+    def handle_update_success(self):
+        """Handle successful update download"""
+        self.status_bar.showMessage("Update downloaded. Restarting application...")
+        self.show_overlay("Update successful! Restarting...")
+        QTimer.singleShot(2000, self.close)  # Close after 2 seconds
 
 
 
