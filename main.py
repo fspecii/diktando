@@ -15,19 +15,22 @@ import sounddevice as sd
 import soundfile as sf
 from pathlib import Path
 from datetime import datetime
-from PyQt5.QtCore import Qt, QThread, pyqtSignal, QTimer, QSize, QUrl
-from PyQt5.QtGui import QIcon, QTextCursor, QPainter, QColor, QFont, QDesktopServices, QKeySequence
+from PyQt5.QtCore import Qt, QThread, pyqtSignal, QTimer, QSize, QUrl, QMimeData, QPoint, QRect
+from PyQt5.QtGui import QIcon, QTextCursor, QPainter, QColor, QFont, QDesktopServices, QKeySequence, QPalette, QBrush
 from PyQt5.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, 
-    QPushButton, QLabel, QComboBox, QProgressBar, QFileDialog, 
-    QMessageBox, QTabWidget, QGroupBox, QRadioButton, QTextEdit,
-    QCheckBox, QDialog, QStatusBar, QButtonGroup, QMenu, QStyle
+    QPushButton, QLabel, QTextEdit, QProgressBar, QStatusBar,
+    QFileDialog, QMessageBox, QComboBox, QCheckBox, QGroupBox,
+    QRadioButton, QTabWidget, QSpinBox, QLineEdit, QSystemTrayIcon,
+    QMenu, QAction, QDialog, QDialogButtonBox, QKeySequenceEdit, QButtonGroup
 )
 from updater import UpdateChecker
 
 # Import custom modules
 from clipboard_manager import ClipboardManager
 from updater import UpdateChecker
+from llm_processor import LLMProcessor
+from llm_settings_dialog import LLMSettingsDialog
 
 # Import keyboard hook library based on platform
 if platform.system() == "Windows":
@@ -60,13 +63,22 @@ class AudioRecorder(QThread):
         self.device = device
         self.recording = False
         self.audio_data = []
+        self.min_volume_threshold = 0.001  # Minimum volume threshold
+        self.gain = 5.0  # Audio gain multiplier
         
     def run(self):
         try:
             print(f"Starting audio recording with device: {self.device}, sample rate: {self.sample_rate}, channels: {self.channels}")
             
-            with sd.InputStream(samplerate=self.sample_rate, channels=self.channels, 
-                               device=self.device, callback=self.audio_callback):
+            # Configure input stream with higher buffer size and blocksize
+            with sd.InputStream(
+                samplerate=self.sample_rate,
+                channels=self.channels,
+                device=self.device,
+                callback=self.audio_callback,
+                blocksize=2048,  # Larger block size for better quality
+                latency='low'    # Low latency for better responsiveness
+            ) as stream:
                 print("Audio stream opened successfully")
                 while self.recording:
                     time.sleep(0.1)
@@ -81,21 +93,12 @@ class AudioRecorder(QThread):
             audio_array = np.concatenate(self.audio_data, axis=0)
             print(f"Audio array shape: {audio_array.shape}, min: {audio_array.min()}, max: {audio_array.max()}")
             
+            # Apply gain and normalization
+            audio_array = self.process_audio(audio_array)
+            
             # Save to WAV file
             temp_dir = os.path.dirname(os.path.abspath(__file__))
             output_file = os.path.join(temp_dir, "recording.wav")
-            
-            # Ensure the audio data is in the correct format
-            if np.isnan(audio_array).any():
-                print("Warning: NaN values detected in audio data, replacing with zeros")
-                audio_array = np.nan_to_num(audio_array)
-                
-            # Normalize audio if it's too quiet
-            max_amplitude = np.max(np.abs(audio_array))
-            if max_amplitude < 0.1:  # If the maximum amplitude is very low
-                print(f"Audio signal is very quiet (max amplitude: {max_amplitude}), normalizing")
-                if max_amplitude > 0:  # Avoid division by zero
-                    audio_array = audio_array / max_amplitude * 0.5  # Normalize to 50% amplitude
             
             print(f"Saving audio to {output_file}")
             sf.write(output_file, audio_array, self.sample_rate)
@@ -118,16 +121,50 @@ class AudioRecorder(QThread):
             print(f"Recording error: {str(e)}\n{error_details}")
             self.error_signal.emit(f"Recording error: {str(e)}")
     
+    def process_audio(self, audio_array):
+        """Process the audio array to improve quality"""
+        try:
+            # Apply gain
+            audio_array = audio_array * self.gain
+            
+            # Calculate RMS value
+            rms = np.sqrt(np.mean(np.square(audio_array)))
+            print(f"Audio RMS before normalization: {rms}")
+            
+            # Only normalize if the audio is too quiet
+            if rms < self.min_volume_threshold:
+                print(f"Audio signal is very quiet (RMS: {rms}), normalizing")
+                max_amplitude = np.max(np.abs(audio_array))
+                if max_amplitude > 0:
+                    # Normalize to 80% of maximum possible amplitude
+                    audio_array = audio_array / max_amplitude * 0.8
+                    print(f"Normalized audio - New RMS: {np.sqrt(np.mean(np.square(audio_array)))}")
+            
+            # Ensure we don't have any clipping
+            audio_array = np.clip(audio_array, -1.0, 1.0)
+            
+            return audio_array
+            
+        except Exception as e:
+            print(f"Error processing audio: {str(e)}")
+            return audio_array
+    
     def audio_callback(self, indata, frames, time, status):
         if status:
             print(f"Status: {status}")
         
-        # Check if the audio data contains actual sound
-        if np.max(np.abs(indata)) < 0.01:
+        # Calculate current volume level
+        volume_level = np.max(np.abs(indata))
+        
+        # Only emit warning if volume is very low
+        if volume_level < self.min_volume_threshold:
             print("Warning: Very low audio level detected")
             
+        # Apply gain in real-time for level meter
+        indata_gained = indata * self.gain
+        
         self.audio_data.append(indata.copy())
-        self.update_signal.emit(indata)
+        self.update_signal.emit(indata_gained)
     
     def start_recording(self):
         self.recording = True
@@ -377,123 +414,24 @@ class Transcriber(QThread):
 
 class HotkeyManager(QThread):
     """Manages global hotkeys and clipboard operations"""
-    hotkey_toggle_signal = pyqtSignal()  # For toggle mode
-    hotkey_press_signal = pyqtSignal()   # For push-to-talk press
-    hotkey_release_signal = pyqtSignal()  # For push-to-talk release
+    hotkey_toggle_signal = pyqtSignal(str)  # For toggle mode, emits hotkey_id
+    hotkey_press_signal = pyqtSignal(str)   # For push-to-talk press, emits hotkey_id
+    hotkey_release_signal = pyqtSignal(str)  # For push-to-talk release, emits hotkey_id
     error_signal = pyqtSignal(str)
     paste_complete_signal = pyqtSignal(bool)  # True if successful, False otherwise
     
     def __init__(self, parent=None):
         super().__init__(parent)
-        self.hotkey = None
-        self.is_push_to_talk = True  # Default to push-to-talk mode
-        self.is_pressed = False
+        self.running = False
+        self.hotkeys = {}  # Dictionary to store multiple hotkeys: {hotkey_string: {'id': id, 'is_push_to_talk': bool, 'is_pressed': bool}}
         self.transcription = None
-        self.clipboard_manager = ClipboardManager()  # Use the enhanced ClipboardManager
-        
-        # Log the available clipboard formats
-        self.log_clipboard_formats()
-    
-    def log_clipboard_formats(self):
-        """Log the available clipboard formats for debugging"""
-        try:
-            content_types = self.clipboard_manager.get_clipboard_content_type()
-            if content_types:
-                print(f"Available clipboard formats: {', '.join(content_types)}")
-            else:
-                print("No clipboard formats available")
-        except Exception as e:
-            print(f"Error getting clipboard formats: {str(e)}")
-    
-    def set_mode(self, is_push_to_talk):
-        """Set the hotkey mode"""
-        self.is_push_to_talk = is_push_to_talk
-    
-    def set_hotkey(self, hotkey):
-        """Set the hotkey to listen for"""
-        self.hotkey = hotkey
-        
-    def run(self):
-        """Run the hotkey listener"""
-        self.running = True
-        
-        # Start the fallback timer for key release detection if in push-to-talk mode
-        if self.is_push_to_talk:
-            self.key_check_timer = threading.Timer(0.1, self._check_key_state)
-            self.key_check_timer.daemon = True
-            self.key_check_timer.start()
-        
-        if platform.system() == "Windows":
-            self._run_windows_listener()
-        else:
-            self._run_pynput_listener()
-    
-    def _check_key_state(self):
-        """Fallback mechanism to check if the key is still pressed"""
-        try:
-            if not self.running:
-                return
-                
-            if self.is_pressed and self.is_push_to_talk and platform.system() == "Windows":
-                # Check if the key is still pressed
-                hotkey_parts = self.hotkey.lower().split('+')
-                
-                # For single key hotkeys
-                if len(hotkey_parts) == 1:
-                    if not keyboard.is_pressed(hotkey_parts[0]):
-                        print(f"Fallback detection: {hotkey_parts[0]} is no longer pressed")
-                        self.is_pressed = False
-                        self._on_key_release(None)
-                # For combination hotkeys, check if any part is released
-                else:
-                    all_pressed = True
-                    for part in hotkey_parts:
-                        if not keyboard.is_pressed(part):
-                            all_pressed = False
-                            break
-                    
-                    if not all_pressed:
-                        print(f"Fallback detection: Hotkey combination {self.hotkey} is no longer fully pressed")
-                        self.is_pressed = False
-                        self._on_key_release(None)
-            
-            # Schedule the next check
-            if self.running and self.is_push_to_talk:
-                self.key_check_timer = threading.Timer(0.05, self._check_key_state)  # Check every 50ms instead of 100ms
-                self.key_check_timer.daemon = True
-                self.key_check_timer.start()
-                
-        except Exception as e:
-            print(f"Error in key state check: {str(e)}")
-            # Schedule the next check even if there was an error
-            if self.running and self.is_push_to_talk:
-                self.key_check_timer = threading.Timer(0.05, self._check_key_state)  # Check every 50ms instead of 100ms
-    
-    def _run_windows_listener(self):
-        """Run the Windows-specific keyboard listener"""
-        try:
-            print(f"Registering hotkey: {self.hotkey}")
-            
-            if self.is_push_to_talk:
-                # For push-to-talk, register the exact hotkey combination
-                keyboard.on_press(lambda e: self._check_hotkey_event(e, True))
-                keyboard.on_release(lambda e: self._check_hotkey_event(e, False))
-            else:
-                # For toggle mode, register the exact hotkey combination
-                keyboard.on_press(lambda e: self._check_hotkey_event(e, True))
-            
-            # Keep the thread running
-            while self.running:
-                time.sleep(0.1)
-            
-            # Unregister the hotkey when done
-            keyboard.unhook_all()
-            
-        except Exception as e:
-            self.error_signal.emit(f"Hotkey error: {str(e)}")
+        self.clipboard_manager = ClipboardManager()  # Use ClipboardManager
+        self.key_check_timer = None  # Timer for fallback key release detection
+        self.last_press_time = 0  # To prevent multiple rapid presses
+        self.debounce_interval = 0.1  # 100ms debounce
     
     def _check_hotkey_event(self, event, is_press):
-        """Check if the event matches our hotkey combination"""
+        """Check if the event matches any of our hotkey combinations"""
         try:
             # Get the name of the pressed key
             if hasattr(event, 'name'):
@@ -503,9 +441,18 @@ class HotkeyManager(QThread):
             
             # Convert to lowercase for case-insensitive comparison
             key_name = key_name.lower()
-            hotkey_parts = self.hotkey.lower().split('+')
+            
+            # Ignore modifier keys when pressed alone
+            if key_name in ['ctrl', 'alt', 'shift', 'windows']:
+                return False
             
             if is_press:
+                # Debounce check for press events
+                current_time = time.time()
+                if current_time - self.last_press_time < self.debounce_interval:
+                    return False
+                self.last_press_time = current_time
+                
                 # Get the modifiers that are currently pressed
                 modifiers = []
                 if keyboard.is_pressed('ctrl'):
@@ -517,134 +464,106 @@ class HotkeyManager(QThread):
                 if keyboard.is_pressed('windows'):
                     modifiers.append('windows')
                 
+                # Sort modifiers to ensure consistent order
+                modifiers.sort()
+                
                 # Construct the current hotkey string
                 if modifiers:
                     current_hotkey = '+'.join(modifiers + [key_name])
                 else:
                     current_hotkey = key_name
                 
-                print(f"Press event - Current hotkey: {current_hotkey}, Registered hotkey: {self.hotkey}")
-                
-                # Check if the current combination matches exactly
-                if current_hotkey.lower() == self.hotkey.lower():
-                    self.is_pressed = True
-                    self._on_key_press(event)
+                # Check if the current combination matches any of our registered hotkeys
+                for hotkey_str, config in self.hotkeys.items():
+                    if current_hotkey.lower() == hotkey_str.lower():
+                        if not config['is_pressed']:  # Only emit if not already pressed
+                            print(f"Hotkey press detected: {hotkey_str} (ID: {config['id']})")
+                            config['is_pressed'] = True
+                            self._on_key_press(event, config['id'])
+                            return True
             else:  # Release event
-                # For single key hotkeys (like F8)
-                if len(hotkey_parts) == 1 and key_name == hotkey_parts[0]:
-                    print(f"Release event - Key {key_name} released, matches hotkey {self.hotkey}")
-                    if self.is_pressed:
-                        self.is_pressed = False
-                        self._on_key_release(event)
-                # For combination hotkeys (like Ctrl+Space)
-                elif key_name in hotkey_parts:
-                    print(f"Release event - Key {key_name} released, part of hotkey {self.hotkey}")
-                    if self.is_pressed:
-                        self.is_pressed = False
-                        self._on_key_release(event)
+                # Check each registered hotkey
+                for hotkey_str, config in self.hotkeys.items():
+                    hotkey_parts = hotkey_str.lower().split('+')
+                    
+                    # For single key hotkeys (like F8)
+                    if len(hotkey_parts) == 1 and key_name == hotkey_parts[0]:
+                        if config['is_pressed']:
+                            print(f"Hotkey release detected: {hotkey_str} (ID: {config['id']})")
+                            config['is_pressed'] = False
+                            self._on_key_release(event, config['id'])
+                            return True
+                    # For combination hotkeys (like Ctrl+Space)
+                    elif key_name in hotkey_parts:
+                        if config['is_pressed']:
+                            print(f"Hotkey part release detected: {key_name} in {hotkey_str} (ID: {config['id']})")
+                            config['is_pressed'] = False
+                            self._on_key_release(event, config['id'])
+                            return True
+            
+            return False
+            
         except Exception as e:
             print(f"Error checking hotkey event: {str(e)}")
             import traceback
             print(traceback.format_exc())
-    
-    def _run_pynput_listener(self):
-        """Run the pynput keyboard listener for macOS and Linux"""
+            return False
+
+    def _check_key_state(self):
+        """Fallback mechanism to check if keys are still pressed"""
         try:
-            # Convert the hotkey string to a key code
-            key_code = self._convert_hotkey_to_pynput(self.hotkey)
+            if not self.running:
+                return
             
-            def on_press(key):
-                if hasattr(key, 'char') and key.char == key_code:
-                    self.is_pressed = True
-                    self._on_key_press(None)
-                elif key == key_code:
-                    self.is_pressed = True
-                    self._on_key_press(None)
+            # Check each hotkey that's in push-to-talk mode
+            for hotkey_str, config in self.hotkeys.items():
+                if config['is_pressed'] and config['is_push_to_talk'] and platform.system() == "Windows":
+                    hotkey_parts = hotkey_str.lower().split('+')
+                    
+                    # For single key hotkeys
+                    if len(hotkey_parts) == 1:
+                        if not keyboard.is_pressed(hotkey_parts[0]):
+                            print(f"Fallback detection: {hotkey_parts[0]} is no longer pressed (ID: {config['id']})")
+                            config['is_pressed'] = False
+                            self._on_key_release(None, config['id'])
+                    # For combination hotkeys, check if any part is released
+                    else:
+                        all_pressed = True
+                        for part in hotkey_parts:
+                            if not keyboard.is_pressed(part):
+                                all_pressed = False
+                                break
+                        if not all_pressed:
+                            print(f"Fallback detection: {hotkey_str} combination is no longer pressed (ID: {config['id']})")
+                            config['is_pressed'] = False
+                            self._on_key_release(None, config['id'])
             
-            def on_release(key):
-                if self.is_push_to_talk:
-                    if hasattr(key, 'char') and key.char == key_code:
-                        if self.is_pressed:
-                            self.is_pressed = False
-                        self._on_key_release(None)
-                    elif key == key_code:
-                        if self.is_pressed:
-                            self.is_pressed = False
-                        self._on_key_release(None)
-            
-            # Start the listener with both press and release callbacks
-            with keyboard.Listener(on_press=on_press, on_release=on_release) as listener:
-                while self.running:
-                    time.sleep(0.1)
-                    if not listener.running:
-                        break
-                        
+            # Schedule the next check
+            if self.running:
+                self.key_check_timer = threading.Timer(0.05, self._check_key_state)  # Check every 50ms
+                self.key_check_timer.daemon = True
+                self.key_check_timer.start()
+                
         except Exception as e:
-            self.error_signal.emit(f"Hotkey error: {str(e)}")
-    
-    def _convert_hotkey_to_pynput(self, hotkey):
-        """Convert a hotkey string to a pynput key code"""
-        # This is a simplified conversion - would need to be expanded for more keys
-        if len(hotkey) == 1:
-            return keyboard.KeyCode.from_char(hotkey)
-        else:
-            # Handle special keys
-            special_keys = {
-                'space': keyboard.Key.space,
-                'enter': keyboard.Key.enter,
-                'tab': keyboard.Key.tab,
-                'esc': keyboard.Key.esc,
-                'f1': keyboard.Key.f1,
-                'f2': keyboard.Key.f2,
-                'f8': keyboard.Key.f8,
-                # Add more as needed
-            }
-            return special_keys.get(hotkey.lower(), keyboard.Key.f8)  # Default to F8
-    
-    def _on_key_press(self, event):
-        """Handle key press event"""
-        if self.is_push_to_talk:
-            self.hotkey_press_signal.emit()
-        else:
-            self.hotkey_toggle_signal.emit()
-    
-    def _on_key_release(self, event):
-        """Handle key release event for push-to-talk mode"""
-        if self.is_push_to_talk:
-            self.hotkey_release_signal.emit()
-    
-    def stop(self):
-        """Stop the hotkey listener"""
-        print("Stopping hotkey listener")
-        self.running = False
-        
-        # Stop the fallback timer
-        if self.key_check_timer:
-            self.key_check_timer.cancel()
-        
-        # Unregister hotkeys on Windows
-        if platform.system() == "Windows":
-            try:
-                keyboard.unhook_all()
-                print("Unhooked all keyboard listeners")
-            except Exception as e:
-                print(f"Error unhooking keyboard listeners: {str(e)}")
-        
-        # For other platforms, the listener will stop when the thread ends
-        # because we're using a context manager with the keyboard.Listener
-    
+            print(f"Error in key state check: {str(e)}")
+            # Schedule the next check even if there was an error
+            if self.running:
+                self.key_check_timer = threading.Timer(0.05, self._check_key_state)
+                self.key_check_timer.daemon = True
+                self.key_check_timer.start()
+
     def backup_clipboard(self):
-        """Backup the current clipboard content"""
+        """Backup current clipboard content"""
         self.clipboard_manager.backup_clipboard()
-    
+
     def restore_clipboard(self):
-        """Restore the original clipboard content"""
+        """Restore clipboard from backup"""
         self.clipboard_manager.restore_clipboard()
-    
+
     def set_transcription(self, text):
-        """Set the transcription text"""
+        """Set text for pasting"""
         self.transcription = text
-    
+
     def paste_transcription(self):
         """Paste the transcription text"""
         if self.transcription:
@@ -678,15 +597,205 @@ class HotkeyManager(QThread):
         self.paste_complete_signal.emit(False)
         return False
 
-    def force_release(self):
-        """Force a key release event (for debugging or recovery)"""
-        print("Forcing hotkey release event")
-        if self.is_pressed:
-            self.is_pressed = False
-            self._on_key_release(None)
-            return True
+    def run(self):
+        """Run the hotkey listener"""
+        self.running = True
+        
+        # Start the fallback timer for key release detection
+        self.key_check_timer = threading.Timer(0.1, self._check_key_state)
+        self.key_check_timer.daemon = True
+        self.key_check_timer.start()
+        
+        if platform.system() == "Windows":
+            self._run_windows_listener()
         else:
-            print("Hotkey not currently pressed, nothing to release")
+            self._run_pynput_listener()
+    
+    def _run_windows_listener(self):
+        """Run the Windows-specific keyboard listener"""
+        try:
+            print(f"Starting hotkey manager with {len(self.hotkeys)} hotkeys: {list(self.hotkeys.keys())}")
+            
+            # Create unique callback functions for this manager instance
+            def on_press(e):
+                # Process events for all hotkeys
+                if self._check_hotkey_event(e, True):
+                    return True  # Stop event propagation
+                return None  # Allow other handlers to process the event
+            
+            def on_release(e):
+                # Process events for all hotkeys
+                if self._check_hotkey_event(e, False):
+                    return True  # Stop event propagation
+                return None  # Allow other handlers to process the event
+            
+            # Create unique names for the callbacks to prevent overwriting
+            callback_id = f"hotkey_manager_{id(self)}"
+            on_press.__name__ = f"on_press_{callback_id}"
+            on_release.__name__ = f"on_release_{callback_id}"
+            
+            # Register both press and release handlers
+            keyboard.on_press(on_press)
+            keyboard.on_release(on_release)
+            
+            # Keep the thread running
+            while self.running:
+                time.sleep(0.1)
+            
+            # Unregister callbacks
+            try:
+                keyboard.unhook(on_press)
+                keyboard.unhook(on_release)
+                print("Successfully unhooked keyboard callbacks")
+            except Exception as e:
+                print(f"Error unhooking keyboard callbacks: {str(e)}")
+            
+        except Exception as e:
+            self.error_signal.emit(f"Hotkey error: {str(e)}")
+            print(f"Error in hotkey listener: {str(e)}")
+            import traceback
+            print(traceback.format_exc())
+    
+    def _run_pynput_listener(self):
+        """Run the pynput keyboard listener for macOS and Linux"""
+        try:
+            # Convert all hotkeys to pynput key codes
+            pynput_keys = {self._convert_hotkey_to_pynput(k): k for k in self.hotkeys.keys()}
+            
+            def on_press(key):
+                for pynput_key, hotkey_str in pynput_keys.items():
+                    if (hasattr(key, 'char') and key.char == pynput_key) or key == pynput_key:
+                        config = self.hotkeys[hotkey_str]
+                        if not config['is_pressed']:
+                            config['is_pressed'] = True
+                            self._on_key_press(None, config['id'])
+            
+            def on_release(key):
+                for pynput_key, hotkey_str in pynput_keys.items():
+                    config = self.hotkeys[hotkey_str]
+                    if config['is_push_to_talk'] and ((hasattr(key, 'char') and key.char == pynput_key) or key == pynput_key):
+                        if config['is_pressed']:
+                            config['is_pressed'] = False
+                            self._on_key_release(None, config['id'])
+            
+            # Start the listener with both press and release callbacks
+            listener = None
+            try:
+                listener = keyboard.Listener(on_press=on_press, on_release=on_release)
+                listener.start()
+                
+                # Keep the thread running
+                while self.running:
+                    time.sleep(0.1)
+                    if listener and not listener.running:
+                        break
+                        
+                # Clean up the listener
+                if listener and listener.running:
+                    try:
+                        listener.stop()
+                        print("Successfully stopped pynput listener")
+                    except Exception as e:
+                        print(f"Error stopping pynput listener: {str(e)}")
+            except Exception as e:
+                print(f"Error in pynput listener: {str(e)}")
+                if listener and listener.running:
+                    try:
+                        listener.stop()
+                    except:
+                        pass
+                        
+        except Exception as e:
+            self.error_signal.emit(f"Hotkey error: {str(e)}")
+            print(f"Error setting up pynput listener: {str(e)}")
+            import traceback
+            print(traceback.format_exc())
+    
+    def _convert_hotkey_to_pynput(self, hotkey):
+        """Convert a hotkey string to a pynput key code"""
+        # This is a simplified conversion - would need to be expanded for more keys
+        if len(hotkey) == 1:
+            return keyboard.KeyCode.from_char(hotkey)
+        else:
+            # Handle special keys
+            special_keys = {
+                'space': keyboard.Key.space,
+                'enter': keyboard.Key.enter,
+                'tab': keyboard.Key.tab,
+                'esc': keyboard.Key.esc,
+                'f1': keyboard.Key.f1,
+                'f2': keyboard.Key.f2,
+                'f8': keyboard.Key.f8,
+                'f9': keyboard.Key.f9,
+                # Add more as needed
+            }
+            return special_keys.get(hotkey.lower(), keyboard.Key.f8)  # Default to F8
+    
+    def _on_key_press(self, event, hotkey_id):
+        """Handle key press event"""
+        for hotkey_str, config in self.hotkeys.items():
+            if config['id'] == hotkey_id:
+                if config['is_push_to_talk']:
+                    self.hotkey_press_signal.emit(hotkey_id)
+                else:
+                    self.hotkey_toggle_signal.emit(hotkey_id)
+                break
+    
+    def _on_key_release(self, event, hotkey_id):
+        """Handle key release event"""
+        for hotkey_str, config in self.hotkeys.items():
+            if config['id'] == hotkey_id and config['is_push_to_talk']:
+                self.hotkey_release_signal.emit(hotkey_id)
+                break
+    
+    def stop(self):
+        """Stop the hotkey listener"""
+        print(f"Stopping hotkey listener with {len(self.hotkeys)} hotkeys")
+        self.running = False
+        
+        # Stop the fallback timer
+        if self.key_check_timer:
+            try:
+                self.key_check_timer.cancel()
+            except Exception as e:
+                print(f"Error canceling key check timer: {str(e)}")
+        
+        # Clear the hotkeys dictionary to prevent further processing
+        self.hotkeys.clear()
+
+    def add_hotkey(self, hotkey_str, hotkey_id, is_push_to_talk=True):
+        """Add or update a hotkey"""
+        self.hotkeys[hotkey_str] = {
+            'id': hotkey_id,
+            'is_push_to_talk': is_push_to_talk,
+            'is_pressed': False
+        }
+        print(f"Added/updated hotkey: {hotkey_str} (ID: {hotkey_id}, Push-to-Talk: {is_push_to_talk})")
+    
+    def remove_hotkey(self, hotkey_id):
+        """Remove a hotkey by ID"""
+        for hotkey_str in list(self.hotkeys.keys()):
+            if self.hotkeys[hotkey_str]['id'] == hotkey_id:
+                del self.hotkeys[hotkey_str]
+                print(f"Removed hotkey with ID: {hotkey_id}")
+                break
+    
+    def set_mode(self, hotkey_id, is_push_to_talk):
+        """Set push-to-talk or toggle mode for a specific hotkey"""
+        for hotkey_str, config in self.hotkeys.items():
+            if config['id'] == hotkey_id:
+                config['is_push_to_talk'] = is_push_to_talk
+                print(f"Set mode for hotkey {hotkey_str} (ID: {hotkey_id}): Push-to-Talk = {is_push_to_talk}")
+                break
+    
+    def force_release(self, hotkey_id):
+        """Force release a specific hotkey"""
+        for hotkey_str, config in self.hotkeys.items():
+            if config['id'] == hotkey_id and config['is_pressed']:
+                config['is_pressed'] = False
+                self._on_key_release(None, hotkey_id)
+                print(f"Forced release of hotkey {hotkey_str} (ID: {hotkey_id})")
+                return True
         return False
 
 
@@ -744,107 +853,40 @@ class WhisperUI(QMainWindow):
     """Main application window"""
     
     def __init__(self):
-        """Initialize the WhisperUI application"""
         super().__init__()
-        
-        # Set application icon
-        icon_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "icon.ico")
-        if os.path.exists(icon_path):
-            icon = QIcon(icon_path)
-            self.setWindowIcon(icon)
-            # Set the application-wide icon
-            QApplication.setWindowIcon(icon)
-            # Also set the taskbar icon for Windows
-            if platform.system() == "Windows":
-                import ctypes
-                myappid = u'diktando.speech.recognition.1.1'  # arbitrary string
-                ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(myappid)
-        
-        # Initialize update checker
-        self.update_checker = UpdateChecker()
-        self.update_checker.update_available_signal.connect(self.show_update_dialog)
-        self.update_checker.update_progress_signal.connect(self.update_progress)
-        self.update_checker.update_error_signal.connect(self.show_error)
-        self.update_checker.update_success_signal.connect(self.handle_update_success)
-        
-        # Initialize clipboard manager
-        self.clipboard_manager = ClipboardManager()
-        
-        # Set up the UI
         self.setWindowTitle("Diktando")
-        self.setMinimumSize(800, 600)
-        
-        # Create status bar first
-        self.status_bar = self.statusBar()
-        self.status_bar.showMessage("Initializing...")
-        
-        # Create overlay window first
-        self.create_overlay_window()
-        
-        # Initialize state flags
-        self.is_hotkey_recording = False
+        self.setMinimumWidth(800)
+        self.setMinimumHeight(600)
+
+        # Initialize variables
+        self.current_file = None
         self.is_recording = False
         self.is_transcribing = False
-        self.is_downloading = False
+        self.is_hotkey_recording = False
+        self.is_llm_recording = False
+        self.hotkey = None
+        self.llm_hotkey = None
+        self.llm_processor = LLMProcessor()
+        self.hotkey_manager = None
+        self.clipboard_manager = ClipboardManager()
+        self.transcription_history = []  # Initialize transcription history
         
-        # Initialize transcription history
-        self.transcription_history = []
-        
-        # Initialize timers
-        self.hotkey_recording_timer = QTimer(self)
-        self.hotkey_recording_timer.timeout.connect(self.update_hotkey_recording_indicator)
-        self.hotkey_recording_timer.setInterval(500)  # Update every 500ms
-        
-        # Check and download required binary files
-        if not self.check_required_binaries():
-            self.show_error("Failed to download required files. Please check your internet connection and try again.")
-            return
-        
-        # Initialize hotkey manager
-        self.hotkey_manager = HotkeyManager(self)
-        self.hotkey_manager.hotkey_toggle_signal.connect(self.on_hotkey_toggle)
-        self.hotkey_manager.hotkey_press_signal.connect(self.on_hotkey_press)
-        self.hotkey_manager.hotkey_release_signal.connect(self.on_hotkey_release)
-        self.hotkey_manager.error_signal.connect(self.show_error)
-        self.hotkey_manager.paste_complete_signal.connect(self.on_paste_complete)
-        
-        # Initialize the UI components
+        # Connect LLM processor signals
+        self.llm_processor.processing_complete.connect(self.on_llm_processing_complete)
+        self.llm_processor.processing_error.connect(self.show_error)
+        self.llm_processor.processing_started.connect(lambda: self.show_overlay("Processing with LLM..."))
+        self.llm_processor.processing_stopped.connect(self.hide_overlay)
+
+        # Initialize UI components
         self.init_ui()
         self.init_models()
         self.init_audio_devices()
         
-        # Initialize thread objects
-        self.recorder = None
-        self.transcriber = None
-        self.downloader = None
-        self.current_audio_file = None
-        self.dark_mode = False
-        
-        # Load saved settings
+        # Load settings
         self.load_settings()
         
-        # Check if any models are installed and download default if needed
-        self.check_and_download_default_model()
-        
-        # Show the main window
-        self.show()
-        
-        # Enable hotkey by default with a slight delay to ensure UI is fully loaded
-        QTimer.singleShot(500, self.enable_hotkey_by_default)
-        
-        # Initialize recording paths
-        self.recording_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "recording.wav")
-        self.debug_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "debug_recordings")
-        self.silence_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "silence.wav")
-        os.makedirs(self.debug_dir, exist_ok=True)
-        
-        # Generate silence file if it doesn't exist
-        if not os.path.exists(self.silence_path):
-            self.generate_silence_file()
-        
-        # Check for updates if enabled
-        if hasattr(self, 'auto_check_updates') and self.auto_check_updates.isChecked():
-            QTimer.singleShot(1000, lambda: self.update_checker.check_for_updates(silent=True))
+        # Enable hotkey by default
+        self.enable_hotkey_by_default()
     
     def __del__(self):
         """Destructor to clean up resources"""
@@ -852,27 +894,8 @@ class WhisperUI(QMainWindow):
         self.cleanup_resources()
     
     def cleanup_resources(self):
-        """Clean up all resources and threads"""
+        """Clean up resources before exiting"""
         print("Cleaning up resources...")
-        
-        # Stop any active timers
-        if hasattr(self, 'hotkey_recording_timer') and self.hotkey_recording_timer.isActive():
-            self.hotkey_recording_timer.stop()
-        
-        if hasattr(self, 'overlay_animation_timer') and self.overlay_animation_timer.isActive():
-            self.overlay_animation_timer.stop()
-        
-        if hasattr(self, 'fade_timer') and self.fade_timer.isActive():
-            self.fade_timer.stop()
-        
-        if hasattr(self, 'fade_out_timer') and self.fade_out_timer.isActive():
-            self.fade_out_timer.stop()
-        
-        # Cancel any active downloads
-        if hasattr(self, 'downloader') and self.downloader and self.downloader.isRunning():
-            print("Canceling active download...")
-            self.downloader.cancel()
-            self.downloader.wait(2000)  # Wait up to 2 seconds for it to finish
         
         # Stop any active recording
         if hasattr(self, 'recorder') and self.recorder and self.recorder.isRunning():
@@ -891,7 +914,7 @@ class WhisperUI(QMainWindow):
             print("Stopping active transcription...")
             self.transcriber.wait(2000)  # Wait up to 2 seconds for it to finish
         
-        print("Resource cleanup complete")
+        print("Cleanup complete, exiting application")
     
     def create_overlay_window(self):
         """Create an overlay window to show recording status"""
@@ -1053,41 +1076,82 @@ class WhisperUI(QMainWindow):
     
     def init_ui(self):
         """Initialize the user interface"""
-        
-        # Create central widget and main layout
-        central_widget = QWidget()
-        self.setCentralWidget(central_widget)
-        main_layout = QVBoxLayout(central_widget)
-        
+        # Set application icon
+        icon_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "icon.ico")
+        if os.path.exists(icon_path):
+            icon = QIcon(icon_path)
+            self.setWindowIcon(icon)
+            # Set the application-wide icon
+            QApplication.setWindowIcon(icon)
+            # Also set the taskbar icon for Windows
+            if platform.system() == "Windows":
+                import ctypes
+                myappid = u'diktando.speech.recognition.1.1'  # arbitrary string
+                ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(myappid)
+
+        # Create status bar
+        self.status_bar = self.statusBar()
+        self.status_bar.showMessage("Initializing...")
+
+        # Create overlay window
+        self.create_overlay_window()
+
+        # Initialize managers and handlers
+        self.clipboard_manager = ClipboardManager()
+        self.hotkey_manager = HotkeyManager(self)
+        self.hotkey_manager.hotkey_toggle_signal.connect(self.on_hotkey_toggle)
+        self.hotkey_manager.hotkey_press_signal.connect(self.on_hotkey_press)
+        self.hotkey_manager.hotkey_release_signal.connect(self.on_hotkey_release)
+        self.hotkey_manager.error_signal.connect(self.show_error)
+        self.hotkey_manager.paste_complete_signal.connect(self.on_paste_complete)
+
+        # Initialize update checker
+        self.update_checker = UpdateChecker()
+        self.update_checker.update_available_signal.connect(self.show_update_dialog)
+        self.update_checker.update_progress_signal.connect(self.update_progress)
+        self.update_checker.update_error_signal.connect(self.show_error)
+        self.update_checker.update_success_signal.connect(self.handle_update_success)
+
+        # Initialize timers
+        self.hotkey_recording_timer = QTimer(self)
+        self.hotkey_recording_timer.timeout.connect(self.update_hotkey_recording_indicator)
+        self.hotkey_recording_timer.setInterval(500)  # Update every 500ms
+
+        # Create main tab widget
+        self.tab_widget = QTabWidget()
+        self.setCentralWidget(self.tab_widget)
+
         # Create tabs
-        tabs = QTabWidget()
-        main_layout.addWidget(tabs)
-        
-        # Create transcription tab
         transcription_tab = QWidget()
-        tabs.addTab(transcription_tab, "Transcription")
-        
-        # Create model management tab
         model_tab = QWidget()
-        tabs.addTab(model_tab, "Models")
-        
-        # Create settings tab
         settings_tab = QWidget()
-        tabs.addTab(settings_tab, "Settings")
         
-        # Set up transcription tab
+        # Setup tab layouts
         self.setup_transcription_tab(transcription_tab)
-        
-        # Set up model management tab
         self.setup_model_tab(model_tab)
-        
-        # Set up settings tab
         self.setup_settings_tab(settings_tab)
         
-        # Create status bar
-        self.status_bar = QStatusBar()
-        self.setStatusBar(self.status_bar)
-        self.status_bar.showMessage("Ready")
+        # Add tabs to widget
+        self.tab_widget.addTab(transcription_tab, "Transcription")
+        self.tab_widget.addTab(model_tab, "Models")
+        self.tab_widget.addTab(settings_tab, "Settings")
+
+        # Initialize recording paths
+        self.recording_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "recording.wav")
+        self.debug_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "debug_recordings")
+        self.silence_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "silence.wav")
+        os.makedirs(self.debug_dir, exist_ok=True)
+
+        # Generate silence file if it doesn't exist
+        if not os.path.exists(self.silence_path):
+            self.generate_silence_file()
+
+        # Show the main window
+        self.show()
+
+        # Check for updates if enabled
+        if hasattr(self, 'auto_check_updates') and self.auto_check_updates.isChecked():
+            QTimer.singleShot(1000, lambda: self.update_checker.check_for_updates(silent=True))
     
     def setup_transcription_tab(self, tab):
         """Set up the transcription tab"""
@@ -1374,6 +1438,18 @@ class WhisperUI(QMainWindow):
         about_layout.addWidget(github_button)
         
         layout.addWidget(about_group)
+        
+        # Add LLM settings section
+        llm_group = QGroupBox("LLM Processing")
+        llm_layout = QVBoxLayout()
+        
+        # LLM settings button
+        llm_settings_btn = QPushButton("Configure LLM Settings")
+        llm_settings_btn.clicked.connect(self.show_llm_settings)
+        llm_layout.addWidget(llm_settings_btn)
+        
+        llm_group.setLayout(llm_layout)
+        layout.addWidget(llm_group)
     
     def init_models(self):
         """Initialize the models list"""
@@ -1403,15 +1479,16 @@ class WhisperUI(QMainWindow):
         """Start recording audio"""
         try:
             device_idx = self.device_combo.currentData()
-            sample_rate = int(self.sample_rate_combo.currentText())
+            self.sample_rate = int(self.sample_rate_combo.currentText())  # Store sample_rate as instance variable
             channels = 1 if self.channels_combo.currentIndex() == 0 else 2
             
-            self.recorder = AudioRecorder(sample_rate, channels, device_idx)
+            self.recorder = AudioRecorder(self.sample_rate, channels, device_idx)
             self.recorder.update_signal.connect(self.update_level_meter)
             self.recorder.finished_signal.connect(self.recording_finished)
             self.recorder.error_signal.connect(self.show_error)
             
             self.recorder.start_recording()
+            self.is_recording = True  # Set recording flag
             
             self.record_button.setText("Stop")
             self.status_bar.showMessage("Recording...")
@@ -1422,7 +1499,9 @@ class WhisperUI(QMainWindow):
     def stop_recording(self):
         """Stop recording audio"""
         if self.recorder and self.recorder.recording:
+            print("Stopping active recording...")
             self.recorder.stop_recording()
+            self.is_recording = False  # Reset recording flag
             self.record_button.setText("Record")
             self.status_bar.showMessage("Processing recording...")
     
@@ -1853,121 +1932,156 @@ class WhisperUI(QMainWindow):
                 self.enable_hotkey_check.setChecked(False)
                 return
             
-            # Convert QKeySequence to a string format that keyboard library can understand
-            hotkey_str = self._convert_key_sequence_to_string(QKeySequence(hotkey))
-            
-            # Stop existing hotkey manager if running
-            if self.hotkey_manager.isRunning():
-                print("Stopping existing hotkey manager")
-                self.hotkey_manager.stop()
-                self.hotkey_manager.wait()  # Wait for thread to finish
+            try:
+                # Convert QKeySequence to a string format that keyboard library can understand
+                hotkey_str = self._convert_key_sequence_to_string(QKeySequence(hotkey))
                 
-                # Create a new hotkey manager since the old one can't be reused
+                # Initialize the hotkey manager if it doesn't exist
+                if not hasattr(self, 'hotkey_manager') or not self.hotkey_manager:
+                    self.hotkey_manager = HotkeyManager(self)
+                    
+                    # Connect signals
+                    self.hotkey_manager.hotkey_toggle_signal.connect(self.on_hotkey_toggle)
+                    self.hotkey_manager.hotkey_press_signal.connect(self.on_hotkey_press)
+                    self.hotkey_manager.hotkey_release_signal.connect(self.on_hotkey_release)
+                    self.hotkey_manager.error_signal.connect(self.show_error)
+                    self.hotkey_manager.paste_complete_signal.connect(self.on_paste_complete)
+                
+                # Stop the manager if it's running
+                if self.hotkey_manager.isRunning():
+                    print("Stopping existing hotkey manager")
+                    self.hotkey_manager.stop()
+                    self.hotkey_manager.wait()  # Wait for thread to finish
+                
+                # Add or update the transcription hotkey
+                is_push_to_talk = self.push_to_talk_radio.isChecked()
+                self.hotkey_manager.add_hotkey(hotkey_str, "transcription", is_push_to_talk)
+                
+                # Add LLM hotkey if configured
+                if hasattr(self, 'llm_hotkey') and self.llm_hotkey:
+                    llm_hotkey_str = self._convert_key_sequence_to_string(QKeySequence(self.llm_hotkey))
+                    self.hotkey_manager.add_hotkey(llm_hotkey_str, "llm", is_push_to_talk)
+                
+                # Start the manager
+                print(f"Starting hotkey manager with hotkeys")
+                self.hotkey_manager.start()
+                
+                # Update status
+                mode_str = "Push-to-Talk" if is_push_to_talk else "Toggle"
+                self.status_bar.showMessage(f"Hotkey enabled: {hotkey} ({mode_str} mode)")
+                
+            except Exception as e:
+                self.show_error(f"Failed to enable hotkey: {str(e)}")
+                self.enable_hotkey_check.setChecked(False)
+                return
+        else:
+            # Stop the hotkey manager
+            if hasattr(self, 'hotkey_manager') and self.hotkey_manager:
+                try:
+                    print("Stopping hotkey manager")
+                    self.hotkey_manager.stop()
+                    self.hotkey_manager.wait()  # Wait for thread to finish
+                    
+                    # Clean up any ongoing recording
+                    if self.is_hotkey_recording:
+                        self.stop_hotkey_recording()
+                    
+                    # Reset state
+                    self.is_hotkey_recording = False
+                    
+                except Exception as e:
+                    print(f"Error stopping hotkey manager: {str(e)}")
+                finally:
+                    self.status_bar.showMessage("Hotkey disabled")
+
+    def setup_llm_hotkey(self):
+        """Setup LLM hotkey in the unified hotkey manager"""
+        try:
+            if not self.llm_hotkey:
+                print("No LLM hotkey configured")
+                return
+                
+            # Initialize the hotkey manager if it doesn't exist
+            if not hasattr(self, 'hotkey_manager') or not self.hotkey_manager:
                 self.hotkey_manager = HotkeyManager(self)
+                
+                # Connect signals
                 self.hotkey_manager.hotkey_toggle_signal.connect(self.on_hotkey_toggle)
                 self.hotkey_manager.hotkey_press_signal.connect(self.on_hotkey_press)
                 self.hotkey_manager.hotkey_release_signal.connect(self.on_hotkey_release)
                 self.hotkey_manager.error_signal.connect(self.show_error)
                 self.hotkey_manager.paste_complete_signal.connect(self.on_paste_complete)
             
-            # Set the mode and hotkey
-            self.hotkey_manager.set_mode(self.push_to_talk_radio.isChecked())
-            self.hotkey_manager.set_hotkey(hotkey_str)
-            self.hotkey_manager.start()
+            # Convert the hotkey to the format keyboard library understands
+            llm_hotkey_str = self._convert_key_sequence_to_string(QKeySequence(self.llm_hotkey))
             
-            mode_str = "Push-to-Talk" if self.push_to_talk_radio.isChecked() else "Toggle"
-            self.status_bar.showMessage(f"Hotkey enabled: {hotkey} ({mode_str} mode)")
-        else:
-            # Stop the hotkey manager
-            if self.hotkey_manager.isRunning():
-                print("Stopping hotkey manager")
-                self.hotkey_manager.stop()
-                self.hotkey_manager.wait()  # Wait for thread to finish
+            # Set mode based on radio buttons
+            is_push_to_talk = True  # Default to push-to-talk
+            if hasattr(self, 'push_to_talk_radio'):
+                is_push_to_talk = self.push_to_talk_radio.isChecked()
             
-            self.status_bar.showMessage("Hotkey disabled")
-
-    def on_hotkey_press(self):
-        """Handle hotkey press in push-to-talk mode"""
-        print("HOTKEY PRESS DETECTED!")
-        if not self.is_hotkey_recording:
-            print("Starting recording via hotkey press")
-            self.start_hotkey_recording()
-        else:
-            print("Hotkey pressed but already recording - ignoring")
-
-    def on_hotkey_release(self):
-        """Handle hotkey release in push-to-talk mode"""
-        print("HOTKEY RELEASE DETECTED!")
-        if self.is_hotkey_recording:
-            print("Hotkey released - stopping recording and starting transcription")
-            # Stop recording - this will trigger the finished_signal which calls hotkey_recording_finished
-            self.stop_hotkey_recording()
-            # Update status
-            self.status_bar.showMessage("Processing recording...")
-        else:
-            print("Hotkey released but not recording - ignoring")
-
-    def show_hotkey_config(self):
-        """Show the hotkey configuration dialog"""
-        current_hotkey = self.hotkey_label.text()
-        dialog = HotkeyConfigDialog(self, current_hotkey)
-        
-        if dialog.exec() == QDialog.DialogCode.Accepted:
-            new_hotkey = dialog.get_hotkey()
-            if new_hotkey:
-                # Update the label
-                self.hotkey_label.setText(new_hotkey)
-                
-                # Save the settings
-                self.save_settings()
-                
-                # If hotkey is enabled, restart with new hotkey
-                if self.enable_hotkey_check.isChecked():
-                    self.toggle_hotkey(False)  # Stop current hotkey
-                    self.toggle_hotkey(True)   # Start with new hotkey
-                
-                self.status_bar.showMessage(f"Hotkey updated to: {new_hotkey}")
+            # Add or update the LLM hotkey
+            self.hotkey_manager.add_hotkey(llm_hotkey_str, "llm", is_push_to_talk)
+            
+            # Start the manager if it's not already running
+            if not self.hotkey_manager.isRunning():
+                print(f"Starting hotkey manager with LLM hotkey: {self.llm_hotkey}")
+                self.hotkey_manager.start()
             else:
-                self.show_error("Please enter a valid hotkey")
-    
-    def _convert_key_sequence_to_string(self, key_sequence):
-        """Convert a QKeySequence to a string format for the keyboard library"""
-        key_text = key_sequence.toString()
-        
-        # Map Qt key names to keyboard library key names
-        key_map = {
-            "F1": "f1", "F2": "f2", "F3": "f3", "F4": "f4",
-            "F5": "f5", "F6": "f6", "F7": "f7", "F8": "f8",
-            "F9": "f9", "F10": "f10", "F11": "f11", "F12": "f12",
-            "Space": "space", "Return": "enter", "Tab": "tab",
-            "Escape": "esc", "Ctrl": "ctrl", "Alt": "alt",
-            "Shift": "shift", "Meta": "windows"
-        }
-        
-        # Handle key combinations
-        if "+" in key_text:
-            parts = key_text.split("+")
-            # Convert each part using the map
-            converted_parts = []
-            for part in parts:
-                part = part.strip()
-                # Convert the key using the map, or use lowercase if not in map
-                converted_parts.append(key_map.get(part, part.lower()))
-            # Join with + to create the hotkey string
-            return "+".join(converted_parts)
-        else:
-            # Single key
-            return key_map.get(key_text, key_text.lower())
-    
-    def on_hotkey_toggle(self):
+                print(f"Added LLM hotkey {self.llm_hotkey} to existing hotkey manager")
+                
+        except Exception as e:
+            self.show_error(f"Error setting up LLM hotkey: {str(e)}")
+
+    def on_hotkey_press(self, hotkey_id):
+        """Handle hotkey press event - starts recording in push-to-talk mode"""
+        try:
+            print(f"Hotkey press event for ID: {hotkey_id}")
+            
+            if hotkey_id == "transcription":
+                if not self.is_hotkey_recording and not self.is_transcribing:
+                    self.start_hotkey_recording()
+            elif hotkey_id == "llm":
+                if not self.is_recording and not self.is_transcribing:
+                    print("Starting LLM recording...")
+                    self.start_llm_recording()
+        except Exception as e:
+            self.show_error(f"Hotkey press error: {str(e)}")
+
+    def on_hotkey_release(self, hotkey_id):
+        """Handle hotkey release event - stops recording in push-to-talk mode"""
+        try:
+            print(f"Hotkey release event for ID: {hotkey_id}")
+            
+            if hotkey_id == "transcription":
+                if self.is_hotkey_recording:
+                    self.stop_hotkey_recording()
+            elif hotkey_id == "llm":
+                if self.is_recording and self.is_llm_recording:
+                    print("Stopping LLM recording...")
+                    self.stop_recording()  # Call stop_recording directly
+                    # Don't reset is_llm_recording flag here, it will be reset after transcription
+                    self.show_overlay("Processing recording...")
+        except Exception as e:
+            self.show_error(f"Hotkey release error: {str(e)}")
+
+    def on_hotkey_toggle(self, hotkey_id):
         """Handle hotkey toggle event - starts or stops recording"""
         try:
-            if not self.is_hotkey_recording:
-                # Start recording
-                self.start_hotkey_recording()
-            else:
-                # Stop recording
-                self.stop_hotkey_recording()
+            print(f"Hotkey toggle event for ID: {hotkey_id}")
+            
+            if hotkey_id == "transcription":
+                if not self.is_hotkey_recording:
+                    # Start recording
+                    self.start_hotkey_recording()
+                else:
+                    # Stop recording
+                    self.stop_hotkey_recording()
+            elif hotkey_id == "llm":
+                if not self.is_recording:
+                    self.start_llm_recording()
+                else:
+                    self.stop_llm_recording()
         except Exception as e:
             import traceback
             error_details = traceback.format_exc()
@@ -2099,16 +2213,22 @@ class WhisperUI(QMainWindow):
 
     def hotkey_transcription_finished(self, text):
         """Handle transcription completion from hotkey recording"""
-        # Add to history and get cleaned text
-        cleaned_text = self.append_to_transcription_history(text, source="hotkey")
+        # Clean up the transcription first
+        text = self.clean_transcription(text)
         
         # Set the transcription and attempt to paste it
-        self.hotkey_manager.set_transcription(cleaned_text)
+        self.hotkey_manager.set_transcription(text)
         self.show_overlay("Pasting transcription...")
         self.attempt_paste_transcription()
         
+        # Add to history after cleaning
+        self.append_to_transcription_history(text, source="hotkey")
+        
         # Log the transcription
-        self.log_message(f"Transcription copied to clipboard: {cleaned_text}")
+        self.log_message(f"Transcription completed: {text}")
+        
+        # Hide overlay after a delay
+        QTimer.singleShot(2000, self.hide_overlay)
 
     def attempt_paste_transcription(self):
         """Attempt to paste the transcription and handle any issues"""
@@ -2161,18 +2281,14 @@ class WhisperUI(QMainWindow):
         self.restore_original_clipboard()
     
     def restore_original_clipboard(self):
-        """Restore the original clipboard content"""
+        """Restore the original clipboard content after pasting"""
         try:
-            self.hotkey_manager.restore_clipboard()
-            
-            # Get the content types after restoration
-            content_types = self.clipboard_manager.get_clipboard_content_type()
-            content_type_str = ", ".join(content_types) if content_types else "empty"
-            print(f"Restored clipboard content types: {content_type_str}")
-            
-            self.status_bar.showMessage("Original clipboard content restored")
+            if hasattr(self, 'hotkey_manager') and self.hotkey_manager:
+                self.hotkey_manager.restore_clipboard()
+                print("Original clipboard content restored")
+            else:
+                print("No hotkey manager available to restore clipboard")
         except Exception as e:
-            self.status_bar.showMessage(f"Error restoring clipboard: {str(e)}")
             print(f"Error restoring clipboard: {str(e)}")
 
     def update_hotkey_recording_indicator(self):
@@ -2315,56 +2431,68 @@ class WhisperUI(QMainWindow):
     
     def load_settings(self):
         """Load application settings"""
+        settings_file = self.get_settings_file()
         try:
-            settings_file = self.get_settings_file()
             if os.path.exists(settings_file):
                 with open(settings_file, 'r') as f:
                     settings = json.load(f)
                     
-                    # Load hotkey
-                    if 'hotkey' in settings:
-                        self.hotkey_label.setText(settings['hotkey'])
-                        self.hotkey_manager.set_hotkey(settings['hotkey'])
-                    
-                    # Load mode settings with push-to-talk as default
-                    is_push_to_talk = settings.get('push_to_talk', True)  # Default to True
-                    self.push_to_talk_radio.setChecked(is_push_to_talk)
-                    self.toggle_mode_radio.setChecked(not is_push_to_talk)
-                    self.hotkey_manager.set_mode(is_push_to_talk)
+                    # Load hotkey settings
+                    self.hotkey = settings.get('hotkey', None)
+                    self.llm_hotkey = settings.get('llm_hotkey', None)
                     
                     # Load dark mode setting
-                    if settings.get('dark_mode', True):  # Default to True
-                        self.dark_mode_check.setChecked(True)
-                        self.toggle_dark_mode(True)
+                    dark_mode = settings.get('dark_mode', False)
+                    self.dark_mode_check.setChecked(dark_mode)
+                    self.toggle_dark_mode(dark_mode)
                     
                     # Load auto-check updates setting
-                    self.auto_check_updates.setChecked(settings.get('auto_check_updates', True))
+                    auto_check = settings.get('auto_check_updates', True)
+                    self.auto_check_updates.setChecked(auto_check)
+                    
+                    # Load other settings as needed
             else:
-                # Set defaults for new installation
-                self.push_to_talk_radio.setChecked(True)
-                self.toggle_mode_radio.setChecked(False)
-                self.hotkey_manager.set_mode(True)
-                self.dark_mode_check.setChecked(True)
-                self.toggle_dark_mode(True)
+                self._set_default_settings()
         except Exception as e:
             print(f"Error loading settings: {str(e)}")
-            # Set defaults on error
+            self._set_default_settings()
+    
+    def _set_default_settings(self):
+        """Set default application settings"""
+        # Set default hotkeys
+        self.hotkey = 'F8'
+        self.llm_hotkey = 'F9'
+        
+        # Set default mode
+        if hasattr(self, 'push_to_talk_radio'):
             self.push_to_talk_radio.setChecked(True)
             self.toggle_mode_radio.setChecked(False)
-            self.hotkey_manager.set_mode(True)
+        
+        # Set default dark mode
+        if hasattr(self, 'dark_mode_check'):
             self.dark_mode_check.setChecked(True)
             self.toggle_dark_mode(True)
+        
+        # Set default auto-check updates
+        if hasattr(self, 'auto_check_updates'):
+            self.auto_check_updates.setChecked(True)
+        
+        # Initialize hotkey managers with default settings
+        self.toggle_hotkey(True)  # This will create and configure the hotkey manager
+        self.setup_llm_hotkey()   # This will create and configure the LLM hotkey manager
     
     def save_settings(self):
-        """Save settings to file"""
+        """Save application settings"""
         settings_file = self.get_settings_file()
         try:
             settings = {
-                'hotkey': self.hotkey_label.text(),
-                'push_to_talk': self.push_to_talk_radio.isChecked(),
-                'dark_mode': self.dark_mode_check.isChecked(),
-                'auto_check_updates': self.auto_check_updates.isChecked()
+                'hotkey': self.hotkey,
+                'llm_hotkey': self.llm_hotkey,
+                'push_to_talk': self.push_to_talk_radio.isChecked() if hasattr(self, 'push_to_talk_radio') else True,
+                'dark_mode': self.dark_mode_check.isChecked() if hasattr(self, 'dark_mode_check') else True,
+                'auto_check_updates': self.auto_check_updates.isChecked() if hasattr(self, 'auto_check_updates') else True
             }
+            os.makedirs(os.path.dirname(settings_file), exist_ok=True)
             with open(settings_file, 'w') as f:
                 json.dump(settings, f)
         except Exception as e:
@@ -2379,9 +2507,15 @@ class WhisperUI(QMainWindow):
         # Save the settings
         self.save_settings()
         
-        # Restart the hotkey manager with new mode
-        self.toggle_hotkey(False)  # Stop current
-        self.toggle_hotkey(True)   # Start with new mode
+        # Update the mode for both hotkeys in the unified manager
+        if hasattr(self, 'hotkey_manager') and self.hotkey_manager:
+            is_push_to_talk = self.push_to_talk_radio.isChecked()
+            
+            # Update mode for transcription hotkey
+            self.hotkey_manager.set_mode("transcription", is_push_to_talk)
+            
+            # Update mode for LLM hotkey
+            self.hotkey_manager.set_mode("llm", is_push_to_talk)
         
         # Update status bar
         mode_str = "Push-to-Talk" if self.push_to_talk_radio.isChecked() else "Toggle"
@@ -2409,7 +2543,7 @@ class WhisperUI(QMainWindow):
         
         # Find and update the hotkey info label
         for child in self.findChildren(QLabel):
-            if "press the hotkey" in child.text().lower():
+            if hasattr(child, 'text') and child.text() and "press the hotkey" in child.text().lower():
                 child.setText(hotkey_info_text)
                 break
 
@@ -2433,7 +2567,15 @@ class WhisperUI(QMainWindow):
                 
                 # Create and start transcriber
                 self.transcriber = Transcriber(file_path, model_path, "en")
-                self.transcriber.finished_signal.connect(self.hotkey_transcription_finished)
+                
+                # Connect to different handlers based on whether this is LLM or normal transcription
+                if hasattr(self, 'is_llm_recording') and self.is_llm_recording:
+                    self.log_message("Connecting to LLM transcription handler (is_llm_recording=True)")
+                    self.transcriber.finished_signal.connect(self.llm_transcription_finished)
+                else:
+                    self.log_message("Connecting to regular transcription handler (is_llm_recording=False)")
+                    self.transcriber.finished_signal.connect(self.hotkey_transcription_finished)
+                
                 self.transcriber.error_signal.connect(self.handle_transcription_error)
                 self.transcriber.start()
                 
@@ -2444,6 +2586,31 @@ class WhisperUI(QMainWindow):
         except Exception as e:
             self.log_message(f"Error processing recording: {str(e)}")
             self.show_overlay("ERROR: Failed to process recording")
+    
+    def llm_transcription_finished(self, text):
+        """Handle transcription completion specifically for LLM processing"""
+        try:
+            # Clean up the transcription first
+            cleaned_text = self.clean_transcription(text)
+            
+            # Add to history
+            self.append_to_transcription_history(cleaned_text, source="llm-input")
+            
+            # Start LLM processing
+            self.show_overlay("Processing with LLM...")
+            self.start_llm_processing(cleaned_text)
+            
+            # Log the transcription
+            self.log_message(f"LLM transcription completed: {cleaned_text}")
+            
+            # Reset the LLM recording flag
+            self.is_llm_recording = False
+            
+        except Exception as e:
+            self.show_error(f"Error in LLM transcription: {str(e)}")
+            self.hide_overlay()
+            # Reset the LLM recording flag even if there's an error
+            self.is_llm_recording = False
 
     def manual_trigger_release(self):
         """Manually trigger the hotkey release event for debugging"""
@@ -2452,14 +2619,26 @@ class WhisperUI(QMainWindow):
             print("Recording is active, manually triggering release event")
             
             # Try to force release via the hotkey manager first
-            if self.hotkey_manager and self.hotkey_manager.isRunning():
-                if self.hotkey_manager.force_release():
+            if hasattr(self, 'hotkey_manager') and self.hotkey_manager and self.hotkey_manager.isRunning():
+                if self.hotkey_manager.force_release("transcription"):
                     print("Force release successful via hotkey manager")
                     return
             
             # If that didn't work, call the release handler directly
             print("Calling on_hotkey_release directly")
-            self.on_hotkey_release()
+            self.on_hotkey_release("transcription")
+        elif self.is_llm_recording:
+            print("LLM recording is active, manually triggering release event")
+            
+            # Try to force release via the hotkey manager
+            if hasattr(self, 'hotkey_manager') and self.hotkey_manager and self.hotkey_manager.isRunning():
+                if self.hotkey_manager.force_release("llm"):
+                    print("Force release successful via hotkey manager")
+                    return
+            
+            # If that didn't work, call the release handler directly
+            print("Calling on_hotkey_release directly")
+            self.on_hotkey_release("llm")
         else:
             print("Not currently recording, nothing to release")
             self.status_bar.showMessage("Not recording - nothing to release")
@@ -2662,7 +2841,7 @@ class WhisperUI(QMainWindow):
         """Add a transcription to the history with timestamp and source info"""
         timestamp = time.strftime("%Y-%m-%d %H:%M:%S")
         
-        # Don't clean the text immediately to preserve speech timestamps
+        # Add timestamp and source info
         history_entry = f"[{timestamp}] - {source.upper()}\n{text}\n{'-' * 80}\n\n"
         
         # Add to history list
@@ -2674,8 +2853,8 @@ class WhisperUI(QMainWindow):
         # Scroll to the bottom to show the latest transcription
         self.results_text.moveCursor(QTextCursor.End)
         
-        # Return cleaned version only for clipboard operations
-        return self.clean_transcription(text) if source == "hotkey" else text
+        # Return the original text - cleaning is now done before calling this method
+        return text
 
     def clear_transcription_history(self):
         """Clear the transcription history"""
@@ -2951,50 +3130,64 @@ class WhisperUI(QMainWindow):
             raise
 
     def show_update_dialog(self, current_version, latest_version):
-        """Show a dialog when an update is available"""
+        """Show the update dialog"""
         # Prevent multiple update dialogs
-        if hasattr(self, '_update_dialog') and self._update_dialog is not None:
+        if hasattr(self, 'update_dialog') and self.update_dialog.isVisible():
+            self.update_dialog.activateWindow()
             return
-            
+
         # Create and show the update dialog
-        self._update_dialog = UpdateDialog(self, current_version, latest_version)
+        self.update_dialog = UpdateDialog(self, current_version, latest_version)
         
-        result = self._update_dialog.exec()
+        # Connect signals
+        self.update_checker.update_progress_signal.connect(self.update_dialog.update_progress)
+        self.update_checker.update_success_signal.connect(self.handle_update_success)
+        self.update_checker.update_error_signal.connect(self.handle_update_error)
         
-        if result == QDialog.DialogCode.Accepted:
-            # Show progress in dialog
-            self._update_dialog.show_progress()
-            
-            # Start the update process
-            self.status_bar.showMessage("Downloading update...")
-            self.show_overlay("Downloading update...")
-            
-            # Start the update process
-            latest_release = self.update_checker.check_for_updates(silent=True)
-            if latest_release:
-                # Connect progress signal before starting download
-                self.update_checker.update_progress_signal.connect(self._update_dialog.update_progress)
-                # Connect cleanup to happen after download is complete
-                self.update_checker.update_success_signal.connect(self._cleanup_update_dialog)
-                self.update_checker.update_error_signal.connect(self._cleanup_update_dialog)
-                self.update_checker.download_and_install_update(latest_release)
-        else:
-            # Clean up immediately if dialog was rejected
-            self._cleanup_update_dialog()
-    
+        # Show the dialog
+        self.update_dialog.show()
+
+    def handle_update_success(self):
+        """Handle successful update"""
+        if hasattr(self, 'update_dialog'):
+            self.update_dialog.close()
+        
+        # Show a message about the successful update
+        msg = QMessageBox()
+        msg.setIcon(QMessageBox.Icon.Information)
+        msg.setWindowTitle("Update Successful")
+        msg.setText("The application has been updated successfully.")
+        msg.setInformativeText("The application will now restart to complete the update.")
+        msg.setStandardButtons(QMessageBox.StandardButton.Ok)
+        msg.exec()
+        
+        # Clean up resources before exiting
+        self.cleanup_resources()
+        
+        # Exit the application - the batch script will restart it
+        QApplication.quit()
+
+    def handle_update_error(self, error_message):
+        """Handle update error"""
+        if hasattr(self, 'update_dialog'):
+            self.update_dialog.close()
+        
+        # Show error message
+        msg = QMessageBox()
+        msg.setIcon(QMessageBox.Icon.Critical)
+        msg.setWindowTitle("Update Failed")
+        msg.setText("Failed to update the application.")
+        msg.setInformativeText(f"Error: {error_message}\n\nPlease try again later or download the latest version manually.")
+        msg.setStandardButtons(QMessageBox.StandardButton.Ok)
+        msg.exec()
+
     def _cleanup_update_dialog(self):
-        """Clean up update dialog references and connections"""
-        if hasattr(self, '_update_dialog') and self._update_dialog is not None:
-            try:
-                # Only try to disconnect if the dialog accepted (update started)
-                if self._update_dialog.update_in_progress:
-                    self.update_checker.update_progress_signal.disconnect(self._update_dialog.update_progress)
-                    self.update_checker.update_success_signal.disconnect(self._cleanup_update_dialog)
-                    self.update_checker.update_error_signal.disconnect(self._cleanup_update_dialog)
-            except (TypeError, RuntimeError):
-                # Ignore errors if signals weren't connected
-                pass
-            self._update_dialog = None
+        """Clean up update dialog connections"""
+        if hasattr(self, 'update_dialog'):
+            self.update_checker.update_progress_signal.disconnect(self.update_dialog.update_progress)
+            self.update_checker.update_success_signal.disconnect(self.handle_update_success)
+            self.update_checker.update_error_signal.disconnect(self.handle_update_error)
+            delattr(self, 'update_dialog')
 
     def update_progress(self, progress):
         """Update the progress of the download"""
@@ -3007,85 +3200,342 @@ class WhisperUI(QMainWindow):
         self.show_overlay("Update successful! Restarting...")
         QTimer.singleShot(2000, self.close)  # Close after 2 seconds
 
+    def show_llm_settings(self):
+        """Show LLM settings dialog"""
+        dialog = LLMSettingsDialog(self, self.llm_processor, self.llm_hotkey)
+        if dialog.exec_():
+            settings = dialog.get_settings()
+            
+            # Update LLM processor settings
+            self.llm_processor.set_provider(settings['provider'], settings['api_key'], settings['model'])
+            self.llm_processor.set_prompt_template(settings['prompt_template'])
+            self.llm_processor.set_mode(settings['is_push_to_talk'])
+            
+            # Update hotkey if changed
+            new_hotkey = settings['hotkey']
+            if new_hotkey != self.llm_hotkey:
+                self.llm_hotkey = new_hotkey
+                
+                # Update the hotkey in the unified manager
+                if self.llm_hotkey and hasattr(self, 'hotkey_manager') and self.hotkey_manager:
+                    # Convert to keyboard library format
+                    llm_hotkey_str = self._convert_key_sequence_to_string(QKeySequence(self.llm_hotkey))
+                    
+                    # Update the hotkey
+                    is_push_to_talk = self.push_to_talk_radio.isChecked()
+                    
+                    # Add or update the LLM hotkey
+                    self.hotkey_manager.add_hotkey(llm_hotkey_str, "llm", is_push_to_talk)
+                    
+                    # Restart the manager if it's running
+                    if self.hotkey_manager.isRunning():
+                        self.hotkey_manager.stop()
+                        self.hotkey_manager.wait()
+                        self.hotkey_manager.start()
+                        
+                    print(f"Updated LLM hotkey to: {self.llm_hotkey}")
+                elif not self.llm_hotkey and hasattr(self, 'hotkey_manager') and self.hotkey_manager:
+                    # Remove the LLM hotkey
+                    self.hotkey_manager.remove_hotkey("llm")
+                    print("Removed LLM hotkey")
+            
+            # Save all settings
+            self.save_settings()
+
+    def start_llm_recording(self):
+        """Start recording for LLM processing"""
+        try:
+            # Set flags to indicate this is for LLM
+            self.is_llm_recording = True
+            
+            # Start recording using existing method
+            self.start_recording()
+            self.show_overlay("Recording for LLM...")
+        except Exception as e:
+            self.is_llm_recording = False
+            self.show_error(f"Error starting LLM recording: {str(e)}")
+            self.hide_overlay()
+
+    def stop_llm_recording(self):
+        """Stop recording and initiate LLM processing chain"""
+        try:
+            if self.recorder and self.recorder.recording:
+                print("Stopping LLM recording...")
+                self.stop_recording()  # This will handle the recorder cleanup
+                self.is_llm_recording = False
+                self.show_overlay("Transcribing for LLM...")
+        except Exception as e:
+            self.is_llm_recording = False
+            self.show_error(f"Error stopping LLM recording: {str(e)}")
+            self.hide_overlay()
+
+    def start_llm_processing(self, text):
+        """Start LLM processing with provided text"""
+        try:
+            if text:
+                self.log_message(f"Starting LLM processing with text: {text[:100]}...")
+                
+                # Check if LLM processor is initialized
+                if not hasattr(self, 'llm_processor') or not self.llm_processor:
+                    self.log_message("Error: LLM processor not initialized")
+                    self.show_error("LLM processor not initialized")
+                    return
+                
+                # Check if API key is configured
+                if not self.llm_processor.api_key:
+                    self.log_message("Error: No API key configured for LLM")
+                    self.show_error("No API key configured. Please set up LLM settings first.")
+                    return
+                
+                # Start processing
+                self.llm_processor.start_processing(text)
+                self.show_overlay("Processing with LLM...")
+            else:
+                self.log_message("Error: No text to process with LLM")
+                self.show_error("No text to process")
+        except Exception as e:
+            self.log_message(f"Error starting LLM processing: {str(e)}")
+            self.show_error(f"Error starting LLM processing: {str(e)}")
+            self.hide_overlay()
+
+    def stop_llm_processing(self):
+        """Stop LLM processing"""
+        try:
+            self.llm_processor.stop_processing()
+            self.hide_overlay()
+        except Exception as e:
+            self.show_error(f"Error stopping LLM processing: {str(e)}")
+            self.hide_overlay()
+
+    def on_llm_processing_complete(self, processed_text):
+        """Handle LLM processing completion"""
+        try:
+            if processed_text:
+                self.log_message(f"LLM processing complete. Result: {processed_text[:100]}...")
+                
+                # Add to history with LLM response tag
+                self.append_to_transcription_history(processed_text, source="llm-response")
+                
+                # Set the processed text for pasting using the hotkey manager
+                if hasattr(self, 'hotkey_manager') and self.hotkey_manager:
+                    # Show overlay and attempt to paste
+                    self.show_overlay("Pasting LLM response...")
+                    
+                    # Backup clipboard before pasting
+                    self.log_message("Backing up clipboard content")
+                    self.hotkey_manager.backup_clipboard()
+                    
+                    # Add a small delay to ensure backup is complete
+                    time.sleep(0.1)
+                    
+                    # Set the transcription text in the hotkey manager
+                    self.hotkey_manager.set_transcription(processed_text)
+                    
+                    # Set clipboard content and paste
+                    if self.auto_paste_check.isChecked():
+                        self.log_message("Auto-paste enabled, pasting LLM response")
+                        paste_success = self.hotkey_manager.paste_transcription()
+                        if paste_success:
+                            self.log_message("LLM response pasted successfully")
+                        else:
+                            self.log_message("Failed to paste LLM response")
+                    else:
+                        # Just set the clipboard without pasting
+                        self.log_message("Auto-paste disabled, copying LLM response to clipboard")
+                        self.clipboard_manager.set_clipboard_text(processed_text)
+                        self.status_bar.showMessage("LLM response copied to clipboard")
+                        self.hotkey_manager.paste_complete_signal.emit(False)
+                    
+                    # Restore the original clipboard after a delay
+                    QTimer.singleShot(2000, self.restore_original_clipboard)
+                else:
+                    self.log_message("Error: Hotkey manager not initialized")
+                    self.show_error("Hotkey manager not initialized")
+            else:
+                self.log_message("Error: LLM processing returned empty result")
+                self.show_error("LLM processing returned empty result")
+        except Exception as e:
+            self.log_message(f"Error handling LLM result: {str(e)}")
+            self.show_error(f"Error handling LLM result: {str(e)}")
+            import traceback
+            self.log_message(traceback.format_exc())
+        finally:
+            QTimer.singleShot(3000, self.hide_overlay)  # Hide overlay after 3 seconds
+
+    def show_hotkey_config(self):
+        """Show the hotkey configuration dialog"""
+        current_hotkey = self.hotkey_label.text()
+        dialog = HotkeyConfigDialog(self, current_hotkey)
+        
+        if dialog.exec() == QDialog.DialogCode.Accepted:
+            new_hotkey = dialog.get_hotkey()
+            if new_hotkey:
+                # Update the label
+                self.hotkey_label.setText(new_hotkey)
+                self.hotkey = new_hotkey
+                
+                # Save the settings
+                self.save_settings()
+                
+                # If hotkey is enabled, update the hotkey manager
+                if self.enable_hotkey_check.isChecked() and hasattr(self, 'hotkey_manager') and self.hotkey_manager:
+                    # Convert to keyboard library format
+                    hotkey_str = self._convert_key_sequence_to_string(QKeySequence(new_hotkey))
+                    
+                    # Update the hotkey
+                    is_push_to_talk = self.push_to_talk_radio.isChecked()
+                    
+                    # Stop the manager if it's running
+                    if self.hotkey_manager.isRunning():
+                        self.hotkey_manager.stop()
+                        self.hotkey_manager.wait()
+                    
+                    # Add or update the transcription hotkey
+                    self.hotkey_manager.add_hotkey(hotkey_str, "transcription", is_push_to_talk)
+                    
+                    # Add LLM hotkey if configured
+                    if hasattr(self, 'llm_hotkey') and self.llm_hotkey:
+                        llm_hotkey_str = self._convert_key_sequence_to_string(QKeySequence(self.llm_hotkey))
+                        self.hotkey_manager.add_hotkey(llm_hotkey_str, "llm", is_push_to_talk)
+                    
+                    # Start the manager
+                    self.hotkey_manager.start()
+                
+                self.status_bar.showMessage(f"Hotkey updated to: {new_hotkey}")
+            else:
+                self.show_error("Please enter a valid hotkey")
+    
+    def _convert_key_sequence_to_string(self, key_sequence):
+        """Convert a QKeySequence to a string format for the keyboard library"""
+        key_text = key_sequence.toString()
+        
+        # Map Qt key names to keyboard library key names
+        key_map = {
+            "F1": "f1", "F2": "f2", "F3": "f3", "F4": "f4",
+            "F5": "f5", "F6": "f6", "F7": "f7", "F8": "f8",
+            "F9": "f9", "F10": "f10", "F11": "f11", "F12": "f12",
+            "Space": "space", "Return": "enter", "Tab": "tab",
+            "Escape": "esc", "Ctrl": "ctrl", "Alt": "alt",
+            "Shift": "shift", "Meta": "windows"
+        }
+        
+        # Handle key combinations
+        if "+" in key_text:
+            parts = key_text.split("+")
+            # Convert each part using the map
+            converted_parts = []
+            for part in parts:
+                part = part.strip()
+                # Convert the key using the map, or use lowercase if not in map
+                converted_parts.append(key_map.get(part, part.lower()))
+            # Join with + to create the hotkey string
+            return "+".join(converted_parts)
+        else:
+            # Single key
+            return key_map.get(key_text, key_text.lower())
+
 
 class UpdateDialog(QDialog):
-    """Custom dialog for update confirmation and progress"""
+    """Dialog for updating the application"""
+    
     def __init__(self, parent=None, current_version=None, latest_version=None):
         super().__init__(parent)
         self.setWindowTitle("Update Available")
         self.setModal(True)
         self.setMinimumWidth(400)
         
+        self.current_version = current_version
+        self.latest_version = latest_version
+        self.update_in_progress = False
+        
         # Create layout
         layout = QVBoxLayout(self)
         
-        # Add icon and message
-        message_layout = QHBoxLayout()
-        icon_label = QLabel()
-        icon_label.setPixmap(self.style().standardIcon(QStyle.SP_MessageBoxInformation).pixmap(32, 32))
-        message_layout.addWidget(icon_label)
+        # Add icon and title
+        header_layout = QHBoxLayout()
         
-        message_text = QLabel(
-            f"A new version of Diktando is available!\n\n"
-            f"Current version: {current_version}\n"
-            f"Latest version: {latest_version}\n\n"
-            f"Would you like to update now?"
-        )
-        message_text.setWordWrap(True)
-        message_layout.addWidget(message_text)
-        layout.addLayout(message_layout)
+        # Add update icon
+        update_icon = QLabel()
+        update_icon.setPixmap(QIcon.fromTheme("system-software-update").pixmap(48, 48))
+        header_layout.addWidget(update_icon)
+        
+        # Add title and description
+        title_layout = QVBoxLayout()
+        title = QLabel(f"<h3>Update Available: {latest_version}</h3>")
+        description = QLabel(f"You are currently using version {current_version}. Would you like to update to the latest version?")
+        description.setWordWrap(True)
+        
+        title_layout.addWidget(title)
+        title_layout.addWidget(description)
+        
+        header_layout.addLayout(title_layout)
+        layout.addLayout(header_layout)
         
         # Add progress bar (hidden initially)
-        self.progress_bar = QProgressBar(self)
-        self.progress_bar.setRange(0, 100)
-        self.progress_bar.setValue(0)
-        self.progress_bar.hide()
+        self.progress_bar = QProgressBar()
+        self.progress_bar.setVisible(False)
         layout.addWidget(self.progress_bar)
         
-        # Add buttons
-        button_box = QHBoxLayout()
+        # Add status label (hidden initially)
+        self.status_label = QLabel("Downloading update...")
+        self.status_label.setVisible(False)
+        layout.addWidget(self.status_label)
         
-        self.update_button = QPushButton("Update Now")
+        # Add buttons
+        button_layout = QHBoxLayout()
+        
+        self.update_button = QPushButton("Update Now", self)
         self.update_button.clicked.connect(self._handle_update_click)
         
-        self.cancel_button = QPushButton("Cancel")
+        self.cancel_button = QPushButton("Later", self)
         self.cancel_button.clicked.connect(self.reject)
         
-        button_box.addWidget(self.update_button)
-        button_box.addWidget(self.cancel_button)
-        layout.addLayout(button_box)
+        button_layout.addWidget(self.update_button)
+        button_layout.addWidget(self.cancel_button)
         
-        # Flag to track if update is in progress
-        self.update_in_progress = False
-        
-        # Remove the close button from the title bar
-        self.setWindowFlags(self.windowFlags() & ~Qt.WindowCloseButtonHint)
+        layout.addLayout(button_layout)
     
     def _handle_update_click(self):
-        """Handle update button click by disabling it immediately and accepting the dialog"""
-        if not self.update_in_progress:
-            self.update_in_progress = True
-            self.update_button.setEnabled(False)
-            self.update_button.setText("Starting update...")
-            self.cancel_button.setEnabled(False)
-            self.accept()
+        """Handle the update button click"""
+        self.update_in_progress = True
+        self.show_progress()
+        
+        # Get the latest release info
+        latest_release = self.parent().update_checker.check_for_updates(silent=True)
+        if latest_release:
+            # Start the update process
+            self.parent().update_checker.download_and_install_update(latest_release)
+        else:
+            self.parent().handle_update_error("Failed to get latest release information")
     
     def show_progress(self):
-        """Show progress bar and disable update button"""
-        self.progress_bar.show()
-        self.update_button.setText("Updating...")
+        """Show the progress bar and update the dialog"""
+        self.progress_bar.setVisible(True)
+        self.progress_bar.setValue(0)
+        self.status_label.setVisible(True)
+        self.status_label.setText("Downloading update...")
+        
+        # Disable buttons during update
+        self.update_button.setEnabled(False)
+        self.cancel_button.setEnabled(False)
+        
+        # Remove the close button from the title bar
+        self.setWindowFlags(self.windowFlags() & ~Qt.WindowType.WindowCloseButtonHint)
+        self.show()  # Need to call show() after changing window flags
     
     def update_progress(self, value):
         """Update the progress bar value"""
         self.progress_bar.setValue(value)
+        if value == 100:
+            self.status_label.setText("Update downloaded. Preparing to install...")
     
     def closeEvent(self, event):
-        """Handle dialog close event"""
+        """Handle the window close event"""
         if self.update_in_progress:
             event.ignore()
         else:
             event.accept()
-            
+    
     def reject(self):
         """Handle dialog rejection (Cancel button or Escape key)"""
         if not self.update_in_progress:
@@ -3101,33 +3551,42 @@ if __name__ == "__main__":
     # Use a try-finally block to ensure proper cleanup
     try:
         exit_code = app.exec()
+    except Exception as e:
+        print(f"Application error: {str(e)}")
+        exit_code = 1
     finally:
         # Ensure all threads are properly stopped before exiting
         print("Application exiting, cleaning up threads...")
         
-        # Cancel any active downloads
-        if hasattr(window, 'downloader') and window.downloader and window.downloader.isRunning():
-            print("Canceling active download...")
-            window.downloader.cancel()
-            window.downloader.wait(2000)  # Wait up to 2 seconds for it to finish
-        
-        # Stop any active recording
-        if hasattr(window, 'recorder') and window.recorder and window.recorder.isRunning():
-            print("Stopping active recording...")
-            window.recorder.recording = False
-            window.recorder.wait(2000)  # Wait up to 2 seconds for it to finish
-        
-        # Stop the hotkey manager
-        if hasattr(window, 'hotkey_manager') and window.hotkey_manager and window.hotkey_manager.isRunning():
-            print("Stopping hotkey manager...")
-            window.hotkey_manager.stop()
-            window.hotkey_manager.wait(2000)  # Wait up to 2 seconds for it to finish
-        
-        # Stop any active transcription
-        if hasattr(window, 'transcriber') and window.transcriber and window.transcriber.isRunning():
-            print("Stopping active transcription...")
-            window.transcriber.wait(2000)  # Wait up to 2 seconds for it to finish
-        
-        print("Cleanup complete, exiting application")
+        try:
+            # Cancel any active downloads
+            if hasattr(window, 'downloader') and window.downloader and window.downloader.isRunning():
+                print("Canceling active download...")
+                window.downloader.cancel()
+                window.downloader.wait(2000)  # Wait up to 2 seconds for it to finish
+            
+            # Stop any active recording
+            if hasattr(window, 'recorder') and window.recorder and window.recorder.isRunning():
+                print("Stopping active recording...")
+                window.recorder.recording = False
+                window.recorder.wait(2000)  # Wait up to 2 seconds for it to finish
+            
+            # Stop the hotkey manager
+            if hasattr(window, 'hotkey_manager') and window.hotkey_manager and window.hotkey_manager.isRunning():
+                print("Stopping hotkey manager...")
+                try:
+                    window.hotkey_manager.stop()
+                    window.hotkey_manager.wait(2000)  # Wait up to 2 seconds for it to finish
+                except Exception as e:
+                    print(f"Error stopping hotkey manager: {str(e)}")
+            
+            # Stop any active transcription
+            if hasattr(window, 'transcriber') and window.transcriber and window.transcriber.isRunning():
+                print("Stopping active transcription...")
+                window.transcriber.wait(2000)  # Wait up to 2 seconds for it to finish
+            
+            print("Cleanup complete, exiting application")
+        except Exception as e:
+            print(f"Error during cleanup: {str(e)}")
     
     sys.exit(exit_code) 

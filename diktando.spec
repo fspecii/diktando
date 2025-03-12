@@ -73,5 +73,5 @@ exe = EXE(
     target_arch=None,
     codesign_identity=None,
     entitlements_file=None,
-    icon='venv/Lib/site-packages/PyInstaller/bootloader/images/icon-windowed.ico'
+    icon='icon.ico'
 )

@@ -10,4 +10,4 @@ draw.ellipse([(20, 20), (236, 236)], fill=(0, 120, 212, 255))
 draw.ellipse([(60, 60), (196, 196)], fill=(255, 255, 255, 0))
 
 # Save as ICO
-image.save('new_icon.ico', format='ICO') 
+image.save('icon.ico', format='ICO') 

@@ -14,7 +14,7 @@ class UpdateChecker(QObject):
     update_success_signal = pyqtSignal()
 
     GITHUB_API_URL = "https://api.github.com/repos/fspecii/diktando/releases"
-    CURRENT_VERSION = "v1.1"  # This should match your current release version
+    CURRENT_VERSION = "v1.2"  # This should match your current release version
 
     def __init__(self):
         super().__init__()
@@ -64,6 +64,10 @@ class UpdateChecker(QObject):
 
     def download_and_install_update(self, release):
         """Download and install the latest release"""
+        temp_path = None
+        batch_path = None
+        log_path = None
+        
         try:
             # Find the asset that matches our platform
             asset = None
@@ -83,9 +87,11 @@ class UpdateChecker(QObject):
             # Get the total file size
             total_size = int(response.headers.get('content-length', 0))
             
-            # Create a temporary file path
-            temp_path = os.path.join(os.path.dirname(self.executable_path), 
-                                   f"DiktandoApp_new.exe")
+            # Create paths for temporary files
+            app_dir = os.path.dirname(self.executable_path)
+            temp_path = os.path.join(app_dir, "DiktandoApp_new.exe")
+            batch_path = os.path.join(app_dir, "update.bat")
+            log_path = os.path.join(app_dir, "update_log.txt")
 
             # Download with progress updates
             block_size = 1024
@@ -98,25 +104,54 @@ class UpdateChecker(QObject):
                     progress = int((downloaded / total_size) * 100)
                     self.update_progress_signal.emit(progress)
 
-            # Create a batch file to replace the executable
-            batch_path = os.path.join(os.path.dirname(self.executable_path), 
-                                    "update.bat")
-            
+            # Create a batch file to handle the update process
             with open(batch_path, 'w') as f:
                 f.write('@echo off\n')
-                f.write('timeout /t 1 /nobreak >nul\n')  # Wait for original process to exit
-                f.write(f'move /y "{temp_path}" "{self.executable_path}"\n')
-                f.write(f'start "" "{self.executable_path}"\n')
-                f.write(f'del "%~f0"\n')  # Delete the batch file itself
+                f.write('echo Starting update process... > "%s"\n' % log_path)
+                f.write('timeout /t 2 /nobreak >nul\n')  # Wait longer for original process to exit
+                
+                # Try to terminate any remaining instances
+                f.write('taskkill /F /IM "%s" >nul 2>&1\n' % os.path.basename(self.executable_path))
+                f.write('timeout /t 1 /nobreak >nul\n')
+                
+                # Attempt to move the new executable
+                f.write('echo Attempting to replace executable... >> "%s"\n' % log_path)
+                f.write('if exist "%s" (\n' % temp_path)
+                f.write('    move /y "%s" "%s" >> "%s" 2>&1\n' % (temp_path, self.executable_path, log_path))
+                f.write('    if errorlevel 1 (\n')
+                f.write('        echo Failed to move new executable >> "%s"\n' % log_path)
+                f.write('        exit /b 1\n')
+                f.write('    )\n')
+                f.write(') else (\n')
+                f.write('    echo New executable not found >> "%s"\n' % log_path)
+                f.write('    exit /b 1\n')
+                f.write(')\n')
+                
+                # Verify the new executable exists
+                f.write('if exist "%s" (\n' % self.executable_path)
+                f.write('    echo Update successful, launching application... >> "%s"\n' % log_path)
+                f.write('    start "" "%s"\n' % self.executable_path)
+                f.write(') else (\n')
+                f.write('    echo Failed to verify new executable >> "%s"\n' % log_path)
+                f.write('    exit /b 1\n')
+                f.write(')\n')
+                
+                # Clean up
+                f.write('echo Cleaning up... >> "%s"\n' % log_path)
+                f.write('timeout /t 2 /nobreak >nul\n')
+                f.write('del "%s" >nul 2>&1\n' % log_path)
+                f.write('del "%~f0"\n')  # Delete the batch file itself
 
-            # Start the batch file and exit the application
+            # Start the batch file and emit success signal
             subprocess.Popen([batch_path], shell=True)
             self.update_success_signal.emit()
 
         except Exception as e:
             self.update_error_signal.emit(f"Failed to install update: {str(e)}")
-            if os.path.exists(temp_path):
-                try:
-                    os.remove(temp_path)
-                except:
-                    pass 
+            # Clean up temporary files
+            for path in [temp_path, batch_path, log_path]:
+                if path and os.path.exists(path):
+                    try:
+                        os.remove(path)
+                    except:
+                        pass 
