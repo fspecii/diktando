@@ -14,7 +14,7 @@ class UpdateChecker(QObject):
     update_success_signal = pyqtSignal()
 
     GITHUB_API_URL = "https://api.github.com/repos/fspecii/diktando/releases"
-    CURRENT_VERSION = "v1.2"  # This should match your current release version
+    CURRENT_VERSION = "v1.3-nc"  # This should match your current release version - nc for non-commercial
 
     def __init__(self):
         super().__init__()
