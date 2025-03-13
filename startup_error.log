@@ -1,0 +1,11 @@
+
+
+=== ERROR 2025-03-13 13:11:54 ===
+Exception: KeyboardInterrupt: 
+Traceback:
+  File "C:\ai\diktando\main.py", line 2590, in closeEvent
+    logger.info("Application close event triggered")
+  File "C:\Users\ambsd\AppData\Local\Programs\Python\Python310\lib\logging\__init__.py", line 1467, in info
+    def info(self, msg, *args, **kwargs):
+
+==================================================

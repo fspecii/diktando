@@ -31,16 +31,28 @@ class LLMProcessor(QObject):
     processing_stopped = pyqtSignal()  # Signal when processing stops
 
     def __init__(self):
-        super().__init__()
-        self.provider = "gemini"  # Default provider
-        self.api_key = ""
-        self.model = "gemini-1.5-pro"  # Updated to a model that supports vision
-        self.prompt_template = "Process and improve the following transcription: {text}"
-        self.is_push_to_talk = True  # Default to push-to-talk mode
-        self.is_processing = False
-        self.include_screenshot = False  # Default to not include screenshots
-        self.screenshot_data = None  # Will store the screenshot data when captured
-        self.load_settings()
+        try:
+            super().__init__()
+            self.provider = "gemini"  # Default provider
+            self.api_key = ""
+            self.model = "gemini-1.5-pro"  # Updated to a model that supports vision
+            self.prompt_template = "Process and improve the following transcription: {text}"
+            self.is_push_to_talk = True  # Default to push-to-talk mode
+            self.is_processing = False
+            self.include_screenshot = False  # Default to not include screenshots
+            self.screenshot_data = None  # Will store the screenshot data when captured
+            
+            # Safely load settings
+            try:
+                self.load_settings()
+                print("LLM processor initialized successfully")
+            except Exception as e:
+                print(f"Warning: Failed to load LLM settings: {str(e)}")
+                # Continue with defaults
+        except Exception as e:
+            print(f"Critical error initializing LLM processor: {str(e)}")
+            import traceback
+            traceback.print_exc()
 
     def load_settings(self):
         """Load LLM settings from file"""
@@ -109,18 +121,60 @@ class LLMProcessor(QObject):
         try:
             print("Attempting to capture screenshot...")
             
-            # Get the primary screen
-            screen = QApplication.primaryScreen()
+            # Get the primary screen with timeout protection
+            import threading
+            screen_event = threading.Event()
+            screen_result = [None]
+            
+            def get_screen():
+                try:
+                    screen_result[0] = QApplication.primaryScreen()
+                    screen_event.set()
+                except Exception as e:
+                    print(f"Error getting primary screen: {str(e)}")
+                    screen_event.set()
+            
+            # Run screen capture in a separate thread with timeout
+            screen_thread = threading.Thread(target=get_screen)
+            screen_thread.daemon = True
+            screen_thread.start()
+            
+            # Wait for screen capture with timeout
+            if not screen_event.wait(timeout=3.0):  # 3 second timeout
+                print("Error: Timeout getting primary screen")
+                return False
+                
+            screen = screen_result[0]
             if not screen:
                 print("Error: Could not get primary screen")
                 return False
                 
             print("Got primary screen, capturing window...")
             
-            # Capture the entire screen
-            pixmap = screen.grabWindow(0)  # 0 means the entire screen
+            # Capture the entire screen with timeout protection
+            grab_event = threading.Event()
+            pixmap_result = [None]
             
-            if pixmap.isNull():
+            def grab_window():
+                try:
+                    pixmap_result[0] = screen.grabWindow(0)  # 0 means the entire screen
+                    grab_event.set()
+                except Exception as e:
+                    print(f"Error grabbing window: {str(e)}")
+                    grab_event.set()
+            
+            # Run grab in a separate thread with timeout
+            grab_thread = threading.Thread(target=grab_window)
+            grab_thread.daemon = True
+            grab_thread.start()
+            
+            # Wait for grab with timeout
+            if not grab_event.wait(timeout=3.0):  # 3 second timeout
+                print("Error: Timeout grabbing window")
+                return False
+                
+            pixmap = pixmap_result[0]
+            if not pixmap or pixmap.isNull():
                 print("Error: Failed to capture screenshot")
                 return False
                 

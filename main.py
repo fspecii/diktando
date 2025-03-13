@@ -13,6 +13,7 @@ import subprocess
 import numpy as np
 import sounddevice as sd
 import soundfile as sf
+import logging
 from pathlib import Path
 from datetime import datetime
 from PyQt5.QtCore import Qt, QThread, pyqtSignal, QTimer, QSize, QUrl, QMimeData, QPoint, QRect
@@ -24,7 +25,106 @@ from PyQt5.QtWidgets import (
     QRadioButton, QTabWidget, QSpinBox, QLineEdit, QSystemTrayIcon,
     QMenu, QAction, QDialog, QDialogButtonBox, QKeySequenceEdit, QButtonGroup
 )
-from updater import UpdateChecker
+
+# Global debug flag - set to 1 to enable logging, 0 to disable
+DEBUG = 1
+
+# Initialize logger variable at the top level to avoid circular dependencies
+logger = logging.getLogger('diktando')
+
+# Setup logging
+def setup_logging(debug_mode=False):
+    """Set up logging based on debug mode"""
+    global logger
+    
+    try:
+        if debug_mode:
+            # Determine the application directory - handle both script and frozen app
+            if getattr(sys, 'frozen', False):
+                # Running as compiled executable
+                app_dir = os.path.dirname(sys.executable)
+            else:
+                # Running as script
+                app_dir = os.path.dirname(os.path.abspath(__file__))
+            
+            # Create logs directory if it doesn't exist
+            logs_dir = os.path.join(app_dir, 'logs')
+            try:
+                os.makedirs(logs_dir, exist_ok=True)
+                original_print(f"Created logs directory at: {logs_dir}")
+            except Exception as e:
+                original_print(f"Error creating logs directory: {str(e)}")
+                # Fallback to temp directory if we can't create logs in app dir
+                import tempfile
+                logs_dir = os.path.join(tempfile.gettempdir(), 'diktando_logs')
+                os.makedirs(logs_dir, exist_ok=True)
+                original_print(f"Using fallback logs directory: {logs_dir}")
+            
+            # Create log file with timestamp
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            log_file = os.path.join(logs_dir, f"diktando_{timestamp}.log")
+            
+            try:
+                # Set up file handler
+                file_handler = logging.FileHandler(log_file, encoding='utf-8')
+                file_handler.setLevel(logging.DEBUG)
+                file_formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+                file_handler.setFormatter(file_formatter)
+                
+                # Set up console handler
+                console_handler = logging.StreamHandler()
+                console_handler.setLevel(logging.DEBUG)
+                console_formatter = logging.Formatter('%(levelname)s: %(message)s')
+                console_handler.setFormatter(console_formatter)
+                
+                # Configure root logger
+                root_logger = logging.getLogger()
+                root_logger.setLevel(logging.DEBUG)
+                root_logger.addHandler(file_handler)
+                root_logger.addHandler(console_handler)
+                
+                # Configure our application logger
+                logger.setLevel(logging.DEBUG)
+                original_print(f"Logging initialized. Log file: {log_file}")
+                
+                return log_file
+            except Exception as e:
+                original_print(f"Error setting up logging: {str(e)}")
+                # Create a dummy logger that does nothing
+                logger.setLevel(logging.CRITICAL)
+        else:
+            # Disable logging
+            logging.getLogger().setLevel(logging.CRITICAL)
+            logging.disable(logging.CRITICAL)
+            # Configure our application logger
+            logger.setLevel(logging.CRITICAL)
+    except Exception as e:
+        original_print(f"Critical error in setup_logging: {str(e)}")
+        # Ensure we always have a logger object even if setup fails
+        logger.setLevel(logging.CRITICAL)
+    
+    return None
+
+# Custom print function that also logs
+original_print = print
+def custom_print(*args, **kwargs):
+    """Custom print function that also logs to file"""
+    # Call the original print function
+    original_print(*args, **kwargs)
+    
+    # Also log the message if debug mode is enabled
+    if DEBUG:
+        try:
+            message = " ".join(str(arg) for arg in args)
+            # Only use logger if it's properly initialized
+            if logger and hasattr(logger, 'info'):
+                logger.info(message)
+        except Exception as e:
+            # If logging fails, just print the error but don't crash
+            original_print(f"Logging error: {str(e)}")
+
+# Replace the built-in print function with our custom one
+print = custom_print
 
 # Import custom modules
 from clipboard_manager import ClipboardManager
@@ -853,40 +953,94 @@ class WhisperUI(QMainWindow):
     """Main application window"""
     
     def __init__(self):
-        super().__init__()
-        self.setWindowTitle("Diktando")
-        self.setMinimumWidth(800)
-        self.setMinimumHeight(600)
+        try:
+            super().__init__()
+            self.setWindowTitle("Diktando")
+            self.setMinimumWidth(800)
+            self.setMinimumHeight(600)
 
-        # Initialize variables
-        self.current_file = None
-        self.is_recording = False
-        self.is_transcribing = False
-        self.is_hotkey_recording = False
-        self.is_llm_recording = False
-        self.hotkey = "F8"  # Default transcription hotkey
-        self.llm_hotkey = "F9"  # Default LLM hotkey
-        self.llm_processor = LLMProcessor()
-        self.hotkey_manager = None
-        self.clipboard_manager = ClipboardManager()
-        self.transcription_history = []  # Initialize transcription history
-        
-        # Connect LLM processor signals
-        self.llm_processor.processing_complete.connect(self.on_llm_processing_complete)
-        self.llm_processor.processing_error.connect(self.show_error)
-        self.llm_processor.processing_started.connect(lambda: self.show_overlay("Processing with LLM..."))
-        self.llm_processor.processing_stopped.connect(self.hide_overlay)
-
-        # Initialize UI components
-        self.init_ui()
-        self.init_models()
-        self.init_audio_devices()
-        
-        # Load settings
-        self.load_settings()
-        
-        # Enable hotkey by default
-        self.enable_hotkey_by_default()
+            # Initialize variables
+            self.current_file = None
+            self.is_recording = False
+            self.is_transcribing = False
+            self.is_hotkey_recording = False
+            self.is_llm_recording = False
+            self.hotkey = "F8"  # Default transcription hotkey
+            self.llm_hotkey = "F9"  # Default LLM hotkey
+            
+            # Initialize components with error handling
+            try:
+                print("Initializing LLM processor...")
+                self.llm_processor = LLMProcessor()
+                print("LLM processor initialized")
+            except Exception as e:
+                print(f"Error initializing LLM processor: {str(e)}")
+                if DEBUG:
+                    logger.error(f"Error initializing LLM processor: {str(e)}")
+                    logger.error(traceback.format_exc())
+                self.llm_processor = None
+            
+            self.hotkey_manager = None
+            
+            try:
+                print("Initializing clipboard manager...")
+                self.clipboard_manager = ClipboardManager()
+                print("Clipboard manager initialized")
+            except Exception as e:
+                print(f"Error initializing clipboard manager: {str(e)}")
+                if DEBUG:
+                    logger.error(f"Error initializing clipboard manager: {str(e)}")
+                    logger.error(traceback.format_exc())
+                self.clipboard_manager = None
+            
+            self.transcription_history = []  # Initialize transcription history
+            
+            # Connect LLM processor signals with error handling
+            if self.llm_processor:
+                try:
+                    print("Connecting LLM processor signals...")
+                    self.llm_processor.processing_complete.connect(self.on_llm_processing_complete)
+                    self.llm_processor.processing_error.connect(self.show_error)
+                    self.llm_processor.processing_started.connect(lambda: self.show_overlay("Processing with LLM..."))
+                    self.llm_processor.processing_stopped.connect(self.hide_overlay)
+                    print("LLM processor signals connected")
+                except Exception as e:
+                    print(f"Error connecting LLM processor signals: {str(e)}")
+                    if DEBUG:
+                        logger.error(f"Error connecting LLM processor signals: {str(e)}")
+                        logger.error(traceback.format_exc())
+            else:
+                print("LLM processor not initialized, skipping signal connection")
+            
+            # Initialize UI components
+            print("Initializing UI components...")
+            self.init_ui()
+            print("UI initialized")
+            
+            print("Initializing models...")
+            self.init_models()
+            print("Models initialized")
+            
+            print("Initializing audio devices...")
+            self.init_audio_devices()
+            print("Audio devices initialized")
+            
+            # Load settings
+            print("Loading settings...")
+            self.load_settings()
+            print("Settings loaded")
+            
+            # Enable hotkey by default
+            print("Setting up hotkeys...")
+            self.enable_hotkey_by_default()
+            print("Hotkeys set up")
+            
+            print("WhisperUI initialization complete")
+        except Exception as e:
+            print(f"Error during WhisperUI initialization: {str(e)}")
+            import traceback
+            traceback.print_exc()
+            raise
     
     def __del__(self):
         """Destructor to clean up resources"""
@@ -1072,21 +1226,117 @@ class WhisperUI(QMainWindow):
     
     def enable_hotkey_by_default(self):
         """Enable the global hotkey by default"""
-        self.enable_hotkey_check.setChecked(True)
+        try:
+            print("Enabling hotkeys by default...")
+            if DEBUG:
+                logger.info("Enabling hotkeys by default...")
+            
+            # Check if UI components are initialized
+            if not hasattr(self, 'enable_hotkey_check'):
+                print("Warning: enable_hotkey_check not initialized yet, skipping hotkey setup")
+                if DEBUG:
+                    logger.warning("enable_hotkey_check not initialized yet, skipping hotkey setup")
+                return
+            
+            try:
+                self.enable_hotkey_check.setChecked(True)
+            except Exception as e:
+                print(f"Error setting enable_hotkey_check: {str(e)}")
+                if DEBUG:
+                    logger.error(f"Error setting enable_hotkey_check: {str(e)}")
+                    logger.error(traceback.format_exc())
+            
+            # Make sure we have default hotkeys set
+            if not self.hotkey:
+                self.hotkey = 'F8'
+                if hasattr(self, 'hotkey_label'):
+                    try:
+                        self.hotkey_label.setText(self.hotkey)
+                    except Exception as e:
+                        print(f"Error setting hotkey_label text: {str(e)}")
+                        if DEBUG:
+                            logger.error(f"Error setting hotkey_label text: {str(e)}")
+                else:
+                    print("Warning: hotkey_label not initialized yet")
+                    if DEBUG:
+                        logger.warning("hotkey_label not initialized yet")
+            
+            if not self.llm_hotkey:
+                self.llm_hotkey = 'F9'
+                if hasattr(self, 'llm_hotkey_label'):
+                    try:
+                        self.llm_hotkey_label.setText(self.llm_hotkey)
+                    except Exception as e:
+                        print(f"Error setting llm_hotkey_label text: {str(e)}")
+                        if DEBUG:
+                            logger.error(f"Error setting llm_hotkey_label text: {str(e)}")
+                else:
+                    print("Warning: llm_hotkey_label not initialized yet")
+                    if DEBUG:
+                        logger.warning("llm_hotkey_label not initialized yet")
+            
+            # Enable the hotkeys with error handling
+            try:
+                self.toggle_hotkey(True)
+                print("Hotkeys enabled successfully")
+                if DEBUG:
+                    logger.info("Hotkeys enabled successfully")
+            except Exception as e:
+                print(f"Error enabling hotkeys: {str(e)}")
+                if DEBUG:
+                    logger.error(f"Error enabling hotkeys: {str(e)}")
+                    logger.error(traceback.format_exc())
+                
+                # Try to provide more diagnostic information
+                if hasattr(self, 'hotkey_manager'):
+                    print(f"Hotkey manager exists: {self.hotkey_manager is not None}")
+                    if DEBUG:
+                        logger.info(f"Hotkey manager exists: {self.hotkey_manager is not None}")
+                else:
+                    print("Hotkey manager not initialized")
+                    if DEBUG:
+                        logger.warning("Hotkey manager not initialized")
         
-        # Make sure we have default hotkeys set
-        if not self.hotkey:
-            self.hotkey = 'F8'
-            if hasattr(self, 'hotkey_label'):
-                self.hotkey_label.setText(self.hotkey)
-        
-        if not self.llm_hotkey:
-            self.llm_hotkey = 'F9'
-            if hasattr(self, 'llm_hotkey_label'):
-                self.llm_hotkey_label.setText(self.llm_hotkey)
-        
-        # Enable the hotkeys
-        self.toggle_hotkey(True)
+        except Exception as e:
+            print(f"Error in enable_hotkey_by_default: {str(e)}")
+            if DEBUG:
+                logger.error(f"Error in enable_hotkey_by_default: {str(e)}")
+                logger.error(traceback.format_exc())
+            
+            # Try to initialize hotkeys in a fallback way
+            try:
+                print("Attempting fallback hotkey initialization...")
+                if DEBUG:
+                    logger.info("Attempting fallback hotkey initialization...")
+                
+                self.hotkey = 'F8'
+                self.llm_hotkey = 'F9'
+                
+                # Only try to initialize hotkey manager if it doesn't exist
+                if not hasattr(self, 'hotkey_manager') or self.hotkey_manager is None:
+                    self.hotkey_manager = HotkeyManager(self)
+                    self.hotkey_manager.hotkey_press_signal.connect(self.on_hotkey_press)
+                    self.hotkey_manager.hotkey_release_signal.connect(self.on_hotkey_release)
+                    self.hotkey_manager.paste_complete_signal.connect(self.on_paste_complete)
+                    self.hotkey_manager.error_signal.connect(self.show_error)
+                
+                # Add the hotkeys
+                self.hotkey_manager.add_hotkey(self.hotkey, "transcription", True)
+                self.hotkey_manager.add_hotkey(self.llm_hotkey, "llm", True)
+                
+                # Start the hotkey manager
+                if not self.hotkey_manager.isRunning():
+                    self.hotkey_manager.start()
+                
+                print("Fallback hotkey initialization successful")
+                if DEBUG:
+                    logger.info("Fallback hotkey initialization successful")
+            except Exception as fallback_error:
+                print(f"Fallback hotkey initialization failed: {str(fallback_error)}")
+                if DEBUG:
+                    logger.error(f"Fallback hotkey initialization failed: {str(fallback_error)}")
+                    logger.error(traceback.format_exc())
+                print("Hotkey initialization failed, continuing without hotkeys")
     
     def init_ui(self):
         """Initialize the user interface"""
@@ -1951,75 +2201,167 @@ class WhisperUI(QMainWindow):
 
     def toggle_hotkey(self, enabled):
         """Toggle the global hotkey functionality"""
-        if enabled:
-            # Get the current hotkey
-            hotkey = self.hotkey_label.text()
-            if not hotkey:
-                self.show_error("Please configure a hotkey first")
-                self.enable_hotkey_check.setChecked(False)
-                return
-            
-            try:
-                # Convert QKeySequence to a string format that keyboard library can understand
-                hotkey_str = self._convert_key_sequence_to_string(QKeySequence(hotkey))
-                
-                # Initialize the hotkey manager if it doesn't exist
-                if not hasattr(self, 'hotkey_manager') or not self.hotkey_manager:
-                    self.hotkey_manager = HotkeyManager(self)
-                    
-                    # Connect signals
-                    self.hotkey_manager.hotkey_toggle_signal.connect(self.on_hotkey_toggle)
-                    self.hotkey_manager.hotkey_press_signal.connect(self.on_hotkey_press)
-                    self.hotkey_manager.hotkey_release_signal.connect(self.on_hotkey_release)
-                    self.hotkey_manager.error_signal.connect(self.show_error)
-                    self.hotkey_manager.paste_complete_signal.connect(self.on_paste_complete)
-                
-                # Stop the manager if it's running
-                if self.hotkey_manager.isRunning():
-                    print("Stopping existing hotkey manager")
-                    self.hotkey_manager.stop()
-                    self.hotkey_manager.wait()  # Wait for thread to finish
-                
-                # Add or update the transcription hotkey
-                is_push_to_talk = self.push_to_talk_radio.isChecked()
-                self.hotkey_manager.add_hotkey(hotkey_str, "transcription", is_push_to_talk)
-                
-                # Add LLM hotkey if configured
-                if hasattr(self, 'llm_hotkey') and self.llm_hotkey:
-                    llm_hotkey_str = self._convert_key_sequence_to_string(QKeySequence(self.llm_hotkey))
-                    self.hotkey_manager.add_hotkey(llm_hotkey_str, "llm", is_push_to_talk)
-                
-                # Start the manager
-                print(f"Starting hotkey manager with hotkeys")
-                self.hotkey_manager.start()
-                
-                # Update status
-                mode_str = "Push-to-Talk" if is_push_to_talk else "Toggle"
-                self.status_bar.showMessage(f"Hotkey enabled: {hotkey} ({mode_str} mode)")
-                
-            except Exception as e:
-                self.show_error(f"Failed to enable hotkey: {str(e)}")
-                self.enable_hotkey_check.setChecked(False)
-                return
-        else:
-            # Stop the hotkey manager
-            if hasattr(self, 'hotkey_manager') and self.hotkey_manager:
+        try:
+            if enabled:
+                # Get the current hotkey
                 try:
-                    print("Stopping hotkey manager")
-                    self.hotkey_manager.stop()
-                    self.hotkey_manager.wait()  # Wait for thread to finish
-                    
-                    # Clean up any ongoing recording
-                    if self.is_hotkey_recording:
-                        self.stop_hotkey_recording()
-                    
-                    # Reset state
-                    self.is_hotkey_recording = False
-                    
+                    hotkey = self.hotkey_label.text()
+                    if not hotkey:
+                        print("No hotkey configured")
+                        if DEBUG:
+                            logger.warning("No hotkey configured")
+                        self.show_error("Please configure a hotkey first")
+                        self.enable_hotkey_check.setChecked(False)
+                        return
                 except Exception as e:
-                    print(f"Error stopping hotkey manager: {str(e)}")
-                finally:
-                    self.status_bar.showMessage("Hotkey disabled")
+                    print(f"Error getting hotkey text: {str(e)}")
+                    if DEBUG:
+                        logger.error(f"Error getting hotkey text: {str(e)}")
+                        logger.error(traceback.format_exc())
+                    self.enable_hotkey_check.setChecked(False)
+                    return
+                
+                try:
+                    # Convert QKeySequence to a string format that keyboard library can understand
+                    hotkey_str = self._convert_key_sequence_to_string(QKeySequence(hotkey))
+                    print(f"Using hotkey: {hotkey_str}")
+                    if DEBUG:
+                        logger.info(f"Using hotkey: {hotkey_str}")
+                    
+                    # Initialize the hotkey manager if it doesn't exist
+                    if not hasattr(self, 'hotkey_manager') or not self.hotkey_manager:
+                        print("Creating new hotkey manager")
+                        if DEBUG:
+                            logger.info("Creating new hotkey manager")
+                        self.hotkey_manager = HotkeyManager(self)
+                        
+                        # Connect signals
+                        try:
+                            print("Connecting hotkey manager signals")
+                            if DEBUG:
+                                logger.info("Connecting hotkey manager signals")
+                            self.hotkey_manager.hotkey_toggle_signal.connect(self.on_hotkey_toggle)
+                            self.hotkey_manager.hotkey_press_signal.connect(self.on_hotkey_press)
+                            self.hotkey_manager.hotkey_release_signal.connect(self.on_hotkey_release)
+                            self.hotkey_manager.error_signal.connect(self.show_error)
+                            self.hotkey_manager.paste_complete_signal.connect(self.on_paste_complete)
+                        except Exception as e:
+                            print(f"Error connecting hotkey manager signals: {str(e)}")
+                            if DEBUG:
+                                logger.error(f"Error connecting hotkey manager signals: {str(e)}")
+                                logger.error(traceback.format_exc())
+                            raise
+                    
+                    # Stop the manager if it's running
+                    if self.hotkey_manager.isRunning():
+                        print("Stopping existing hotkey manager")
+                        if DEBUG:
+                            logger.info("Stopping existing hotkey manager")
+                        try:
+                            self.hotkey_manager.stop()
+                            self.hotkey_manager.wait(2000)  # Wait up to 2 seconds for thread to finish
+                        except Exception as e:
+                            print(f"Error stopping existing hotkey manager: {str(e)}")
+                            if DEBUG:
+                                logger.error(f"Error stopping existing hotkey manager: {str(e)}")
+                                logger.error(traceback.format_exc())
+                    
+                    # Add or update the transcription hotkey
+                    try:
+                        is_push_to_talk = self.push_to_talk_radio.isChecked()
+                        print(f"Adding/updating hotkey: {hotkey_str} (ID: transcription, Push-to-Talk: {is_push_to_talk})")
+                        if DEBUG:
+                            logger.info(f"Adding/updating hotkey: {hotkey_str} (ID: transcription, Push-to-Talk: {is_push_to_talk})")
+                        self.hotkey_manager.add_hotkey(hotkey_str, "transcription", is_push_to_talk)
+                    except Exception as e:
+                        print(f"Error adding transcription hotkey: {str(e)}")
+                        if DEBUG:
+                            logger.error(f"Error adding transcription hotkey: {str(e)}")
+                            logger.error(traceback.format_exc())
+                        raise
+                    
+                    # Add LLM hotkey if configured
+                    if hasattr(self, 'llm_hotkey') and self.llm_hotkey:
+                        try:
+                            llm_hotkey_str = self._convert_key_sequence_to_string(QKeySequence(self.llm_hotkey))
+                            print(f"Adding/updating hotkey: {llm_hotkey_str} (ID: llm, Push-to-Talk: {is_push_to_talk})")
+                            if DEBUG:
+                                logger.info(f"Adding/updating hotkey: {llm_hotkey_str} (ID: llm, Push-to-Talk: {is_push_to_talk})")
+                            self.hotkey_manager.add_hotkey(llm_hotkey_str, "llm", is_push_to_talk)
+                        except Exception as e:
+                            print(f"Error adding LLM hotkey: {str(e)}")
+                            if DEBUG:
+                                logger.error(f"Error adding LLM hotkey: {str(e)}")
+                                logger.error(traceback.format_exc())
+                    
+                    # Start the manager
+                    try:
+                        print("Starting hotkey manager with hotkeys")
+                        if DEBUG:
+                            logger.info("Starting hotkey manager with hotkeys")
+                        self.hotkey_manager.start()
+                    except Exception as e:
+                        print(f"Error starting hotkey manager: {str(e)}")
+                        if DEBUG:
+                            logger.error(f"Error starting hotkey manager: {str(e)}")
+                            logger.error(traceback.format_exc())
+                        raise
+                    
+                    # Update status
+                    try:
+                        mode_str = "Push-to-Talk" if is_push_to_talk else "Toggle"
+                        self.status_bar.showMessage(f"Hotkey enabled: {hotkey} ({mode_str} mode)")
+                    except Exception as e:
+                        print(f"Error updating status bar: {str(e)}")
+                        if DEBUG:
+                            logger.error(f"Error updating status bar: {str(e)}")
+                
+                except Exception as e:
+                    print(f"Failed to enable hotkey: {str(e)}")
+                    if DEBUG:
+                        logger.error(f"Failed to enable hotkey: {str(e)}")
+                        logger.error(traceback.format_exc())
+                    self.show_error(f"Failed to enable hotkey: {str(e)}")
+                    self.enable_hotkey_check.setChecked(False)
+                    return
+            else:
+                # Stop the hotkey manager
+                if hasattr(self, 'hotkey_manager') and self.hotkey_manager:
+                    try:
+                        print("Stopping hotkey manager")
+                        if DEBUG:
+                            logger.info("Stopping hotkey manager")
+                        self.hotkey_manager.stop()
+                        self.hotkey_manager.wait(2000)  # Wait up to 2 seconds for thread to finish
+                        
+                        # Clean up any ongoing recording
+                        if self.is_hotkey_recording:
+                            self.stop_hotkey_recording()
+                        
+                        # Reset state
+                        self.is_hotkey_recording = False
+                        
+                    except Exception as e:
+                        print(f"Error stopping hotkey manager: {str(e)}")
+                        if DEBUG:
+                            logger.error(f"Error stopping hotkey manager: {str(e)}")
+                            logger.error(traceback.format_exc())
+                    finally:
+                        try:
+                            self.status_bar.showMessage("Hotkey disabled")
+                        except Exception as e:
+                            print(f"Error updating status bar: {str(e)}")
+                            if DEBUG:
+                                logger.error(f"Error updating status bar: {str(e)}")
+        except Exception as e:
+            print(f"Unexpected error in toggle_hotkey: {str(e)}")
+            if DEBUG:
+                logger.error(f"Unexpected error in toggle_hotkey: {str(e)}")
+                logger.error(traceback.format_exc())
+            try:
+                self.show_error(f"Unexpected error in toggle_hotkey: {str(e)}")
+            except:
+                pass
 
     def setup_llm_hotkey(self):
         """Setup LLM hotkey in the unified hotkey manager"""
@@ -2687,7 +3029,13 @@ class WhisperUI(QMainWindow):
     def log_message(self, message):
         """Add a message to the debug log"""
         timestamp = time.strftime("%H:%M:%S")
-        print(f"[{timestamp}] {message}")
+        
+        # Use the logging system if in debug mode
+        if DEBUG:
+            logger.info(message)
+        else:
+            # Fallback to print for non-debug mode
+            print(f"[{timestamp}] {message}")
         
         # If we have a debug log text widget, add the message there too
         if hasattr(self, 'debug_log') and self.debug_log is not None:
@@ -3610,48 +3958,138 @@ class UpdateDialog(QDialog):
 
 
 if __name__ == "__main__":
-    app = QApplication(sys.argv)
-    window = WhisperUI()
+    # Set up exception handling for the entire application
+    def exception_hook(exctype, value, traceback):
+        error_msg = f"Uncaught exception: {exctype.__name__}: {value}"
+        print(error_msg)
+        import traceback as tb
+        tb.print_tb(traceback)
+        try:
+            if DEBUG:
+                logger.error(error_msg)
+                logger.error("".join(tb.format_tb(traceback)))
+        except Exception as e:
+            print(f"Error logging exception: {str(e)}")
+        sys.__excepthook__(exctype, value, traceback)
+        
+    # Install the exception hook
+    sys.excepthook = exception_hook
+    
+    # Initialize logging based on debug flag
+    try:
+        setup_logging(debug_mode=DEBUG)
+    except Exception as e:
+        print(f"Error setting up logging: {str(e)}")
+    
+    # Log application start
+    print(f"Starting Diktando application (Debug mode: {'ON' if DEBUG else 'OFF'})")
+    print(f"Python version: {sys.version}")
+    print(f"Platform: {platform.platform()}")
+    print(f"Working directory: {os.getcwd()}")
+    
+    # Check if running as frozen executable
+    if getattr(sys, 'frozen', False):
+        print(f"Running as frozen executable: {sys.executable}")
+        print(f"Executable directory: {os.path.dirname(sys.executable)}")
+    else:
+        print("Running as script")
+    
+    # Create QApplication first
+    try:
+        app = QApplication(sys.argv)
+        print("QApplication initialized successfully")
+    except Exception as e:
+        print(f"Error initializing QApplication: {str(e)}")
+        import traceback
+        traceback.print_exc()
+        sys.exit(1)
+    
+    # Initialize main window with error handling
+    window = None
+    try:
+        print("Initializing WhisperUI...")
+        window = WhisperUI()
+        print("WhisperUI initialized successfully")
+    except Exception as e:
+        error_msg = f"Critical error during initialization: {str(e)}"
+        print(error_msg)
+        import traceback
+        traceback.print_exc()
+        try:
+            if DEBUG:
+                logger.critical(error_msg)
+                logger.critical(traceback.format_exc())
+        except Exception as log_error:
+            print(f"Error logging critical error: {str(log_error)}")
+        
+        # Show error message to user
+        try:
+            error_dialog = QMessageBox()
+            error_dialog.setIcon(QMessageBox.Critical)
+            error_dialog.setWindowTitle("Startup Error")
+            error_dialog.setText("Failed to initialize application")
+            error_dialog.setInformativeText(f"Error: {str(e)}")
+            error_dialog.setDetailedText(traceback.format_exc())
+            error_dialog.exec_()
+        except Exception as dialog_error:
+            print(f"Error showing error dialog: {str(dialog_error)}")
+        
+        sys.exit(1)
     
     # Use a try-finally block to ensure proper cleanup
     try:
+        print("Starting application main loop...")
         exit_code = app.exec()
     except Exception as e:
-        print(f"Application error: {str(e)}")
+        error_msg = f"Application error: {str(e)}"
+        print(error_msg)
+        import traceback
+        traceback.print_exc()
+        if DEBUG:
+            logger.critical(error_msg)
+            logger.critical(traceback.format_exc())
         exit_code = 1
     finally:
         # Ensure all threads are properly stopped before exiting
         print("Application exiting, cleaning up threads...")
         
         try:
-            # Cancel any active downloads
-            if hasattr(window, 'downloader') and window.downloader and window.downloader.isRunning():
-                print("Canceling active download...")
-                window.downloader.cancel()
-                window.downloader.wait(2000)  # Wait up to 2 seconds for it to finish
-            
-            # Stop any active recording
-            if hasattr(window, 'recorder') and window.recorder and window.recorder.isRunning():
-                print("Stopping active recording...")
-                window.recorder.recording = False
-                window.recorder.wait(2000)  # Wait up to 2 seconds for it to finish
-            
-            # Stop the hotkey manager
-            if hasattr(window, 'hotkey_manager') and window.hotkey_manager and window.hotkey_manager.isRunning():
-                print("Stopping hotkey manager...")
-                try:
-                    window.hotkey_manager.stop()
-                    window.hotkey_manager.wait(2000)  # Wait up to 2 seconds for it to finish
-                except Exception as e:
-                    print(f"Error stopping hotkey manager: {str(e)}")
-            
-            # Stop any active transcription
-            if hasattr(window, 'transcriber') and window.transcriber and window.transcriber.isRunning():
-                print("Stopping active transcription...")
-                window.transcriber.wait(2000)  # Wait up to 2 seconds for it to finish
+            if window:
+                # Cancel any active downloads
+                if hasattr(window, 'downloader') and window.downloader and window.downloader.isRunning():
+                    print("Canceling active download...")
+                    window.downloader.cancel()
+                    window.downloader.wait(2000)  # Wait up to 2 seconds for it to finish
+                
+                # Stop any active recording
+                if hasattr(window, 'recorder') and window.recorder and window.recorder.isRunning():
+                    print("Stopping active recording...")
+                    window.recorder.recording = False
+                    window.recorder.wait(2000)  # Wait up to 2 seconds for it to finish
+                
+                # Stop the hotkey manager
+                if hasattr(window, 'hotkey_manager') and window.hotkey_manager and window.hotkey_manager.isRunning():
+                    print("Stopping hotkey manager...")
+                    try:
+                        window.hotkey_manager.stop()
+                        window.hotkey_manager.wait(2000)  # Wait up to 2 seconds for it to finish
+                    except Exception as e:
+                        print(f"Error stopping hotkey manager: {str(e)}")
+                
+                # Stop any active transcription
+                if hasattr(window, 'transcriber') and window.transcriber and window.transcriber.isRunning():
+                    print("Stopping active transcription...")
+                    window.transcriber.wait(2000)  # Wait up to 2 seconds for it to finish
             
             print("Cleanup complete, exiting application")
         except Exception as e:
-            print(f"Error during cleanup: {str(e)}")
+            error_msg = f"Error during cleanup: {str(e)}"
+            print(error_msg)
+            if DEBUG:
+                logger.error(error_msg)
+        
+        # Log application end
+        if DEBUG:
+            logger.info("Application terminated")
     
     sys.exit(exit_code) 
