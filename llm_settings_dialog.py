@@ -64,6 +64,11 @@ class LLMSettingsDialog(QDialog):
         model_layout.addWidget(self.model_combo)
         layout.addLayout(model_layout)
         
+        # Screenshot option
+        self.include_screenshot = QCheckBox("Include screenshot with LLM requests")
+        self.include_screenshot.setToolTip("When enabled, a screenshot of your screen will be captured and sent with each LLM request")
+        layout.addWidget(self.include_screenshot)
+        
         # Hotkey configuration
         hotkey_layout = QHBoxLayout()
         hotkey_layout.addWidget(QLabel("LLM Processing Hotkey:"))
@@ -113,6 +118,9 @@ class LLMSettingsDialog(QDialog):
             index = self.model_combo.findText(self.llm_processor.model)
             if index >= 0:
                 self.model_combo.setCurrentIndex(index)
+            
+            # Set screenshot option
+            self.include_screenshot.setChecked(self.llm_processor.include_screenshot)
     
     def _start_hotkey_recording(self, event):
         """Start recording a new hotkey"""
@@ -159,5 +167,6 @@ class LLMSettingsDialog(QDialog):
             'model': self.model_combo.currentText(),
             'hotkey': self.new_hotkey or self.current_hotkey,
             'prompt_template': self.prompt_edit.toPlainText(),
-            'is_push_to_talk': self.push_to_talk_radio.isChecked()
+            'is_push_to_talk': self.push_to_talk_radio.isChecked(),
+            'include_screenshot': self.include_screenshot.isChecked()
         } 

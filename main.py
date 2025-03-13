@@ -3256,6 +3256,7 @@ class WhisperUI(QMainWindow):
             self.llm_processor.set_provider(settings['provider'], settings['api_key'], settings['model'])
             self.llm_processor.set_prompt_template(settings['prompt_template'])
             self.llm_processor.set_mode(settings['is_push_to_talk'])
+            self.llm_processor.set_include_screenshot(settings['include_screenshot'])
             
             # Update hotkey if changed
             new_hotkey = settings['hotkey']
@@ -3341,9 +3342,15 @@ class WhisperUI(QMainWindow):
                     self.show_error("No API key configured. Please set up LLM settings first.")
                     return
                 
+                # Log screenshot inclusion status
+                if self.llm_processor.include_screenshot:
+                    self.log_message("Screenshot will be included with LLM request")
+                    self.show_overlay("Processing with LLM (with screenshot)...")
+                else:
+                    self.show_overlay("Processing with LLM...")
+                
                 # Start processing
                 self.llm_processor.start_processing(text)
-                self.show_overlay("Processing with LLM...")
             else:
                 self.log_message("Error: No text to process with LLM")
                 self.show_error("No text to process")
@@ -3365,7 +3372,11 @@ class WhisperUI(QMainWindow):
         """Handle LLM processing completion"""
         try:
             if processed_text:
-                self.log_message(f"LLM processing complete. Result: {processed_text[:100]}...")
+                # Log whether screenshot was included in the request
+                if hasattr(self, 'llm_processor') and self.llm_processor.include_screenshot:
+                    self.log_message(f"LLM processing complete with screenshot. Result: {processed_text[:100]}...")
+                else:
+                    self.log_message(f"LLM processing complete. Result: {processed_text[:100]}...")
                 
                 # Add to history with LLM response tag
                 self.append_to_transcription_history(processed_text, source="llm-response")
