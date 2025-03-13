@@ -864,8 +864,8 @@ class WhisperUI(QMainWindow):
         self.is_transcribing = False
         self.is_hotkey_recording = False
         self.is_llm_recording = False
-        self.hotkey = None
-        self.llm_hotkey = None
+        self.hotkey = "F8"  # Default transcription hotkey
+        self.llm_hotkey = "F9"  # Default LLM hotkey
         self.llm_processor = LLMProcessor()
         self.hotkey_manager = None
         self.clipboard_manager = ClipboardManager()
@@ -1073,6 +1073,20 @@ class WhisperUI(QMainWindow):
     def enable_hotkey_by_default(self):
         """Enable the global hotkey by default"""
         self.enable_hotkey_check.setChecked(True)
+        
+        # Make sure we have default hotkeys set
+        if not self.hotkey:
+            self.hotkey = 'F8'
+            if hasattr(self, 'hotkey_label'):
+                self.hotkey_label.setText(self.hotkey)
+        
+        if not self.llm_hotkey:
+            self.llm_hotkey = 'F9'
+            if hasattr(self, 'llm_hotkey_label'):
+                self.llm_hotkey_label.setText(self.llm_hotkey)
+        
+        # Enable the hotkeys
+        self.toggle_hotkey(True)
     
     def init_ui(self):
         """Initialize the user interface"""
@@ -1442,6 +1456,19 @@ class WhisperUI(QMainWindow):
         # Add LLM settings section
         llm_group = QGroupBox("LLM Processing")
         llm_layout = QVBoxLayout()
+        
+        # LLM hotkey configuration
+        llm_hotkey_layout = QHBoxLayout()
+        llm_hotkey_layout.addWidget(QLabel("LLM Hotkey:"))
+        self.llm_hotkey_label = QLabel(self.llm_hotkey if hasattr(self, 'llm_hotkey') and self.llm_hotkey else "F9")
+        llm_hotkey_layout.addWidget(self.llm_hotkey_label)
+        
+        llm_configure_button = QPushButton("Configure")
+        llm_configure_button.clicked.connect(lambda: self.show_llm_settings(show_hotkey_tab=True))
+        llm_hotkey_layout.addWidget(llm_configure_button)
+        llm_hotkey_layout.addStretch()
+        
+        llm_layout.addLayout(llm_hotkey_layout)
         
         # LLM settings button
         llm_settings_btn = QPushButton("Configure LLM Settings")
@@ -2437,9 +2464,16 @@ class WhisperUI(QMainWindow):
                 with open(settings_file, 'r') as f:
                     settings = json.load(f)
                     
-                    # Load hotkey settings
-                    self.hotkey = settings.get('hotkey', None)
-                    self.llm_hotkey = settings.get('llm_hotkey', None)
+                    # Load hotkey settings with defaults if not found
+                    self.hotkey = settings.get('hotkey', 'F8')
+                    self.llm_hotkey = settings.get('llm_hotkey', 'F9')
+                    
+                    # Update UI to reflect loaded hotkeys
+                    if hasattr(self, 'hotkey_label'):
+                        self.hotkey_label.setText(self.hotkey)
+                    
+                    if hasattr(self, 'llm_hotkey_label'):
+                        self.llm_hotkey_label.setText(self.llm_hotkey)
                     
                     # Load dark mode setting
                     dark_mode = settings.get('dark_mode', False)
@@ -2462,6 +2496,13 @@ class WhisperUI(QMainWindow):
         # Set default hotkeys
         self.hotkey = 'F8'
         self.llm_hotkey = 'F9'
+        
+        # Update UI to reflect default hotkeys
+        if hasattr(self, 'hotkey_label'):
+            self.hotkey_label.setText(self.hotkey)
+        
+        if hasattr(self, 'llm_hotkey_label'):
+            self.llm_hotkey_label.setText(self.llm_hotkey)
         
         # Set default mode
         if hasattr(self, 'push_to_talk_radio'):
@@ -3200,9 +3241,14 @@ class WhisperUI(QMainWindow):
         self.show_overlay("Update successful! Restarting...")
         QTimer.singleShot(2000, self.close)  # Close after 2 seconds
 
-    def show_llm_settings(self):
+    def show_llm_settings(self, show_hotkey_tab=False):
         """Show LLM settings dialog"""
         dialog = LLMSettingsDialog(self, self.llm_processor, self.llm_hotkey)
+        
+        # If we're showing the hotkey tab, focus on that
+        if show_hotkey_tab and hasattr(dialog, 'hotkey_edit'):
+            dialog.hotkey_edit.setFocus()
+        
         if dialog.exec_():
             settings = dialog.get_settings()
             
@@ -3215,6 +3261,10 @@ class WhisperUI(QMainWindow):
             new_hotkey = settings['hotkey']
             if new_hotkey != self.llm_hotkey:
                 self.llm_hotkey = new_hotkey
+                
+                # Update UI to reflect the new hotkey
+                if hasattr(self, 'llm_hotkey_label'):
+                    self.llm_hotkey_label.setText(self.llm_hotkey if self.llm_hotkey else "F9")
                 
                 # Update the hotkey in the unified manager
                 if self.llm_hotkey and hasattr(self, 'hotkey_manager') and self.hotkey_manager:
@@ -3241,6 +3291,10 @@ class WhisperUI(QMainWindow):
             
             # Save all settings
             self.save_settings()
+
+        if show_hotkey_tab:
+            self.hotkey_label.setText(self.llm_hotkey)
+            self.llm_hotkey_label.setText(self.llm_hotkey)
 
     def start_llm_recording(self):
         """Start recording for LLM processing"""
